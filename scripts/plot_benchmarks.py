@@ -86,7 +86,7 @@ def run_benchmark(build_dir: Path, exe: str, timeout_s: int = 300) -> str:
 
 
 def parse_heuristic(stdout: str) -> dict:
-    """Parse benchmark_heuristic: warm-up line + sweep table."""
+    """Parse benchmark_heuristic: warm-up line + sweep table + sparsity-driven crossover block."""
     data = {"batch_sizes_k": [64, 128, 256, 384, 512], "safety_margin_alpha": 0.8}
     # Warm-up: [heuristic] warm-up: Standard_Total=X.XX ms, ZeroCopy_Total=X.XX ms ... -> crossover_n=XXXXX
     m = re.search(
@@ -106,6 +106,14 @@ def parse_heuristic(stdout: str) -> dict:
         data["crossover_n"] = 256
         data["standard_path_ms"] = [2.1, 3.8, 6.2, 8.9, 11.5]
         data["zerocopy_path_ms"] = [1.4, 2.1, 3.2, 4.1, 5.0]
+
+    # Sparsity-Driven Crossover (massive table + N=10K): Standard (full table copy) vs Zero-Copy
+    std_full = re.search(r"Standard path \(full table copy \+ lookup\):\s+([\d.]+)\s+ms", stdout)
+    zc_nomig = re.search(r"Zero-Copy path \(no table migration\):\s+([\d.]+)\s+ms", stdout)
+    if std_full and zc_nomig:
+        data["sparsity_n_k"] = 10  # 10K lookups
+        data["sparsity_standard_ms"] = float(std_full.group(1))
+        data["sparsity_zerocopy_ms"] = float(zc_nomig.group(1))
     return data
 
 
@@ -325,16 +333,38 @@ def plot_interconnect_crossover(data: dict, outdir: Path) -> None:
 
     alpha = d["safety_margin_alpha"]
 
-    fig, ax = plt.subplots(figsize=(FIGW, FIGH))
-    ax.plot(n_k, t_std, "o-", color="C0", label="Standard path (Copy + Kernel)", linewidth=2, markersize=8)
-    ax.plot(n_k, t_zc, "s-", color="C1", label="Zero-Copy path (Mapped Memory)", linewidth=2, markersize=8)
+    # Full-page size so the chart is not condensed (x-axis has room for 10K–512K)
+    fig, ax = plt.subplots(figsize=(12.0, 7.0))
 
-    # Safety margin: T_zc < alpha * T_std => acceptable zero-copy region
+    # Safety margin first (behind lines) so it is not masked
     t_thresh = alpha * t_std
-    ax.fill_between(n_k, t_zc, t_thresh, where=(t_zc <= t_thresh), alpha=0.2, color="C1", label=f"Safety margin (α={alpha})")
+    ax.fill_between(n_k, t_zc, t_thresh, where=(t_zc <= t_thresh), alpha=0.28, color="C1", zorder=0,
+                    label=f"Safety margin (α={alpha})")
+
+    ax.plot(n_k, t_std, "o-", color="C0", label="Standard path (Copy + Kernel)", linewidth=2, markersize=8, zorder=2)
+    ax.plot(n_k, t_zc, "s-", color="C1", label="Zero-Copy path (Mapped Memory)", linewidth=2, markersize=8, zorder=2)
+
+    # Sparsity-driven crossover: offset in x so both markers visible; use distinct markers so they don't mask each other
+    sparsity_n = d.get("sparsity_n_k")
+    sparsity_std = d.get("sparsity_standard_ms")
+    sparsity_zc = d.get("sparsity_zerocopy_ms")
+    if sparsity_n is not None and sparsity_std is not None and sparsity_zc is not None:
+        x_std, x_zc = sparsity_n - 0.5, sparsity_n + 0.5
+        ax.plot(x_std, sparsity_std, "*", color="C0", markersize=16, markeredgecolor="black", markeredgewidth=1.2,
+                zorder=5, label="Standard (2GB table copy + 10K lookup)")
+        ax.plot(x_zc, sparsity_zc, "D", color="C1", markersize=10, markeredgecolor="black", markeredgewidth=1.2,
+                zorder=5, label="Zero-Copy (no table migration, 10K lookup)")
+        ax.annotate("Sparsity:\nZero-Copy bypasses\ntable migration tax",
+                    xy=(x_zc, sparsity_zc), xytext=(sparsity_n + 55, (sparsity_std + sparsity_zc) / 2),
+                    fontsize=8, ha="left", va="center",
+                    arrowprops=dict(arrowstyle="->", color="gray", lw=1))
+        if sparsity_zc < sparsity_std * 0.1:  # call out the low point so it's visible
+            ax.annotate(f"  {sparsity_zc:.1f} ms", xy=(x_zc, sparsity_zc), fontsize=8, va="bottom", ha="left")
 
     # Only draw crossover line when it's within the plotted batch-size range (crossover_n is in actual N, so convert to K)
     x_min, x_max = float(np.min(n_k)), float(np.max(n_k))
+    if sparsity_n is not None:
+        x_min = min(x_min, float(sparsity_n) - 0.5)  # sparsity points at 9.5 and 10.5
     if crossover_n_k is not None and x_min <= crossover_n_k <= x_max:
         ax.axvline(x=crossover_n_k, color="gray", linestyle="--", linewidth=1.5, label=f"Crossover N ≈ {int(round(crossover_n_k))}K")
 
@@ -342,10 +372,23 @@ def plot_interconnect_crossover(data: dict, outdir: Path) -> None:
     ax.set_ylabel("End-to-end latency (ms)")
     ax.set_title("Interconnect: Standard vs Zero-Copy Path")
     ax.set_xlim(x_min - (x_max - x_min) * 0.05, x_max + (x_max - x_min) * 0.05)
-    ax.legend(loc="upper left")
-    ax.set_xticks(n_k)
-    ax.set_xticklabels([f"{int(x)}K" for x in n_k])
-    fig.savefig(outdir / "fig1_interconnect_crossover.png")
+    # Ensure bottom y-margin when sparsity point is very low so it and the "10K (sparse)" label don't overlap
+    if sparsity_zc is not None:
+        y_lo, y_hi = ax.get_ylim()
+        if sparsity_zc < y_lo + (y_hi - y_lo) * 0.12:
+            ax.set_ylim(bottom=max(0, sparsity_zc - (y_hi - y_lo) * 0.06))
+    xticks = list(n_k)
+    xtick_labels = [f"{int(x)}K" for x in n_k]
+    if sparsity_n is not None and sparsity_n not in xticks:
+        xticks.append(sparsity_n)
+        xticks.sort()
+        xtick_labels = [f"{int(x)}K" if x != sparsity_n else "10K\n(sparse)" for x in xticks]
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xtick_labels)
+    # Legend outside chart (right) so it never hides data
+    ax.legend(loc="upper left", fontsize=9, bbox_to_anchor=(1.02, 1), frameon=True)
+    fig.tight_layout(rect=[0, 0, 0.78, 1])
+    fig.savefig(outdir / "fig1_interconnect_crossover.png", dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print("Saved fig1_interconnect_crossover.png")
 
