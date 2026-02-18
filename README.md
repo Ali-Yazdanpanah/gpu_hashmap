@@ -136,7 +136,7 @@ Run `./performance_validation_suite` (and/or benchmark with Zipfian workload) to
 
 When the **lookup batch size** (keys + results) exceeds a fraction of **free VRAM**, the heuristic **forces the zero-copy path**:
 
-- **Condition**: \(n_{\mathrm{lookups}} > \texttt{max\_lookups\_fit\_vram}\) (derived from \(\texttt{cudaMemGetInfo}\) at warm-up).
+- **Condition**: *n_lookups* > `max_lookups_fit_vram` (derived from `cudaMemGetInfo` at warm-up).
 - **Effect**: Keys and results reside in **pinned host memory**; the kernel accesses them over PCIe. No device allocation for the batch, so the system scales to batch sizes larger than VRAM (at the cost of PCIe bandwidth).
 
 This provides an **out-of-core** fallback without changing the API.
