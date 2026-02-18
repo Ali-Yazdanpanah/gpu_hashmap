@@ -1,0 +1,2 @@
+/usr/bin/ar qc libgpu_hashmap_analysis.a CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/workloads.cpp.o CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/metrics.cu.o CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/validation.cu.o CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/probe_depth.cu.o
+/usr/bin/ranlib libgpu_hashmap_analysis.a

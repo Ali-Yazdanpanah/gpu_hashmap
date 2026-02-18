@@ -1,0 +1,1 @@
+/usr/lib/nvidia-cuda-toolkit/bin/g++ CMakeFiles/benchmark_performance.dir/tests/benchmark_performance.cu.o -o benchmark_performance  libgpu_hashmap.a /usr/lib/x86_64-linux-gnu/libcudart.so -lcudadevrt -lcudart_static -lrt -lpthread -ldl  -L"/usr/lib/x86_64-linux-gnu/stubs" -L"/usr/lib/x86_64-linux-gnu"

@@ -1,0 +1,119 @@
+{
+  "interconnect": {
+    "batch_sizes_k": [
+      64,
+      128,
+      256,
+      384,
+      512
+    ],
+    "safety_margin_alpha": 0.8,
+    "crossover_n": 18446744073709551615,
+    "standard_path_ms": [
+      1.2825,
+      2.565,
+      5.13,
+      7.695,
+      10.26
+    ],
+    "zerocopy_path_ms": [
+      1.8525,
+      3.705,
+      7.41,
+      11.115,
+      14.82
+    ]
+  },
+  "warp_aggregation": {
+    "alphas": [
+      0.5,
+      1.0,
+      1.5,
+      2.0
+    ],
+    "standard_insert_ms": [
+      164.52,
+      159.23,
+      149.55,
+      972.15
+    ],
+    "warp_agg_insert_ms": [
+      139.842,
+      135.3455,
+      127.1175,
+      826.3275
+    ]
+  },
+  "heterogeneous": {
+    "approaches": [
+      "CPU (unordered_map)",
+      "GPU Chained",
+      "GPU Slab"
+    ],
+    "insert_ms": [
+      64.22,
+      343.06,
+      1.01
+    ],
+    "lookup_ms": [
+      5.03,
+      0.86,
+      0.56
+    ],
+    "total_ops": 1536000
+  },
+  "load_factor": {
+    "load_factor_pct": [
+      10,
+      30,
+      50,
+      70,
+      90,
+      99
+    ],
+    "insert_ms": [
+      8.1,
+      22.3,
+      38.5,
+      52.1,
+      65.2,
+      72.1
+    ],
+    "lookup_ms": [
+      2.1,
+      3.2,
+      4.5,
+      5.8,
+      7.1,
+      8.2
+    ],
+    "throughput_ops_per_sec": [
+      185000,
+      142000,
+      116000,
+      92000,
+      78000,
+      62000
+    ],
+    "avg_probe_depth": [
+      1.05,
+      1.18,
+      1.35,
+      1.62,
+      2.11,
+      3.45
+    ]
+  },
+  "roofline": {
+    "operations": [
+      "Insert",
+      "Lookup"
+    ],
+    "achieved_gbps": [
+      0.24,
+      1.83
+    ],
+    "peak_gen3_gbps": 16,
+    "peak_gen4_gbps": 32
+  }
+}
