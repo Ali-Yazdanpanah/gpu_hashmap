@@ -10,7 +10,7 @@ A **high-performance CUDA key-value store** designed for massive-scale lookups w
 
 This project implements a GPU-accelerated hash table that addresses two central challenges in high-throughput key-value storage:
 
-1. **Hierarchical parallelism**: Combining *block-level* batch allocation (reducing global slab contention by a factor of the block size), *warp-level* aggregation (reducing global atomics from \(N\) to \(N/32\) via shuffle intrinsics), and *slab-bucketed* layouts (128-byte buckets with one atomic per warp) to maximize occupancy and minimize contention.
+1. **Hierarchical parallelism**: Combining *block-level* batch allocation (reducing global slab contention by a factor of the block size), *warp-level* aggregation (reducing global atomics from *N* to *N*/32 via shuffle intrinsics), and *slab-bucketed* layouts (128-byte buckets with one atomic per warp) to maximize occupancy and minimize contention.
 2. **Interconnect-aware data movement**: Offering both an **explicit-copy** path (H2D → kernel → D2H) and a **true zero-copy** path (mapped host memory over PCIe), with a calibrated **heuristic** and **out-of-core** fallback when the batch exceeds VRAM.
 
 ### The Problem
@@ -20,7 +20,7 @@ GPU hash tables face:
 - **Massive atomic contention**: Thousands of threads competing on bucket heads and slab free lists serialize progress and limit throughput.
 - **PCIe bottlenecks**: Transferring keys and results between host and device can dominate end-to-end latency; naive copy-in/copy-out can negate GPU speedups for moderate batch sizes.
 
-This codebase attacks both: **warp-cooperative inserts** and **slab-hashing** cut global atomics; **zero-copy lookup** and a **crossover heuristic** (with safety margin \(\alpha = 0.8\)) choose between standard and in-place mapping based on measured PCIe/copy cost. When the batch does not fit in VRAM, the system **pivots to zero-copy** (system RAM via mapped memory) as an out-of-core fallback.
+This codebase attacks both: **warp-cooperative inserts** and **slab-hashing** cut global atomics; **zero-copy lookup** and a **crossover heuristic** (with safety margin α = 0.8) choose between standard and in-place mapping based on measured PCIe/copy cost. When the batch does not fit in VRAM, the system **pivots to zero-copy** (system RAM via mapped memory) as an out-of-core fallback.
 
 ---
 
@@ -28,19 +28,19 @@ This codebase attacks both: **warp-cooperative inserts** and **slab-hashing** cu
 
 ### 2.1 Slab-Hashing Logic (128-byte buckets)
 
-The **slab hash table** (`gpu_hashmap_slab`) uses fixed-size buckets of \(K = 8\) key-value pairs (16 bytes per pair → **128 bytes per bucket**, two cache lines). Each bucket \(b\) has:
+The **slab hash table** (`gpu_hashmap_slab`) uses fixed-size buckets of *K* = 8 key-value pairs (16 bytes per pair → **128 bytes per bucket**, two cache lines). Each bucket *b* has:
 
 - **Keys/values**: `keys[b * K + slot]`, `values[b * K + slot]` for `slot ∈ [0, K)`.
-- **Occupancy mask**: `used_mask[b]` is a bitmask of width \(K\); bit \(i\) set ⇒ slot \(i\) is occupied.
+- **Occupancy mask**: `used_mask[b]` is a bitmask of width *K*; bit *i* set ⇒ slot *i* is occupied.
 
 **Bit-masking selection** for inserts:
 
-1. **Hash**: \(b = \texttt{hash\_key}(key) \bmod \texttt{num\_buckets}\).
-2. **Empty slots**: \(\texttt{empty} = \lnot \texttt{used\_mask}[b] \land (2^K - 1)\) (low \(K\) bits).
-3. **Claim**: The warp cooperatively selects the first \(\texttt{need\_count}\) zero bits via \(\texttt{__ffs}(\texttt{empty})\) and builds a **claim mask**.
-4. **Atomic**: One \(\texttt{atomicCAS}(\texttt{used\_mask}[b], \texttt{old}, \texttt{old} \lor \texttt{claim})\) per warp (not per thread) to reserve slots.
+1. **Hash**: *b* = `hash_key(key) mod num_buckets`.
+2. **Empty slots**: `empty = ¬used_mask[b] ∧ (2^K - 1)` (low *K* bits).
+3. **Claim**: The warp cooperatively selects the first `need_count` zero bits via `__ffs(empty)` and builds a **claim mask**.
+4. **Atomic**: One `atomicCAS(used_mask[b], old, old ∨ claim)` per warp (not per thread) to reserve slots.
 
-So slot selection is \(O(1)\) in warp size and uses a single global atomic per warp per bucket.
+So slot selection is *O*(1) in warp size and uses a single global atomic per warp per bucket.
 
 ### 2.2 Warp-Cooperative Inserts
 
@@ -48,26 +48,26 @@ Two strategies reduce global atomic operations:
 
 **Chained table (warp aggregation):**
 
-- Threads in a warp that hash to the **same bucket** are identified with \(\texttt{__ballot\_sync}\).
-- A **leader** lane performs \(\texttt{atomicCAS}\) on the bucket head; the new head (slot index) is broadcast with \(\texttt{__shfl\_sync}\) so followers can chain their nodes (each node’s \(\texttt{next}\) points to the previous head).
-- **Effect**: Global atomic operations drop from \(N\) (one per insert) to at most \(N/32\) (one per distinct bucket per warp), with \(\text{O}(1)\) shuffle/ballot cost per warp.
+- Threads in a warp that hash to the **same bucket** are identified with `__ballot_sync`.
+- A **leader** lane performs `atomicCAS` on the bucket head; the new head (slot index) is broadcast with `__shfl_sync` so followers can chain their nodes (each node’s `next` points to the previous head).
+- **Effect**: Global atomic operations drop from *N* (one per insert) to at most *N*/32 (one per distinct bucket per warp), with *O*(1) shuffle/ballot cost per warp.
 
 **Slab table:**
 
-- Same warp ballot to find lanes in the same bucket; **one** \(\texttt{atomicCAS}\) on \(\texttt{used\_mask}[b]\) claims multiple slots for the warp.
+- Same warp ballot to find lanes in the same bucket; **one** `atomicCAS` on `used_mask[b]` claims multiple slots for the warp.
 - Slots are assigned to lanes via a small rank/select over the claim mask.
 
-Both rely on **\(\text{O}(1)\) shuffle intrinsics** (\(\texttt{__shfl\_sync}\), \(\texttt{__ballot\_sync}\)) to avoid extra global memory traffic.
+Both rely on ***O*(1) shuffle intrinsics** (`__shfl_sync`, `__ballot_sync`) to avoid extra global memory traffic.
 
 ### 2.3 Memory Consistency (lock-free)
 
 The chained insert uses **lock-free** updates:
 
 1. **Allocate** a node from the slab (atomic pop from free list).
-2. **Fill** the node (key, value, \(\texttt{next} = \texttt{old\_head}\)) in local memory.
-3. **Publish**: \(\texttt{__threadfence}()\) to ensure the node’s fields are visible to other threads, then \(\texttt{atomicCAS}(\texttt{bucket\_heads}[b], \texttt{old\_head}, \texttt{slot})\).
+2. **Fill** the node (key, value, `next = old_head`) in local memory.
+3. **Publish**: `__threadfence()` to ensure the node’s fields are visible to other threads, then `atomicCAS(bucket_heads[b], old_head, slot)`.
 
-\(\texttt{__threadfence}()\) guarantees that writes to the node are ordered before the CAS that makes the node visible. Combined with the atomic CAS, this gives a lock-free linked-list push. **Lock-free reads**: lookups traverse the chain by reading \(\texttt{bucket\_heads}[b]\) and then \(\texttt{nodes}[.]\texttt{.key}/\texttt{.value}/\texttt{.next}\) without acquiring locks.
+`__threadfence()` guarantees that writes to the node are ordered before the CAS that makes the node visible. Combined with the atomic CAS, this gives a lock-free linked-list push. **Lock-free reads**: lookups traverse the chain by reading `bucket_heads[b]` and then `nodes[].key` / `nodes[].value` / `nodes[].next` without acquiring locks.
 
 ---
 
@@ -77,43 +77,35 @@ The chained insert uses **lock-free** updates:
 
 The **effective memory bandwidth** (GB/s) for a kernel that reads and writes global (or mapped) memory is:
 
-$$
-\mathrm{BW}_{\mathrm{eff}} = \frac{\mathrm{Bytes}_{\mathrm{read}} + \mathrm{Bytes}_{\mathrm{written}}}{T_{\mathrm{execution}}}
-$$
+**BW_eff** = (Bytes_read + Bytes_written) / T_execution
 
-Here \(T_{\mathrm{execution}}\) is the kernel execution time in seconds. For lookup-only, \(\mathrm{Bytes}_{\mathrm{read}}\) includes keys and hash-table traffic; \(\mathrm{Bytes}_{\mathrm{written}}\) is the result buffer. The **PCIe roofline** (see below) uses the same idea for the zero-copy path, where bytes are moved over the interconnect.
+Here *T_execution* is the kernel execution time in seconds. For lookup-only, Bytes_read includes keys and hash-table traffic; Bytes_written is the result buffer. The **PCIe roofline** (see below) uses the same idea for the zero-copy path, where bytes are moved over the interconnect.
 
 ### 3.2 Heuristic Crossover Model (Standard vs Zero-Copy)
 
-Let \(S\) = batch size in bytes (keys + results), \(B_{\mathrm{pcie}}\) = PCIe bandwidth, \(B_{\mathrm{vram}}\) = device memory bandwidth, and \(A\) = access factor (ratio of actual memory traffic to \(S\) for the kernel). Then:
+Let *S* = batch size in bytes (keys + results), *B_pcie* = PCIe bandwidth, *B_vram* = device memory bandwidth, and *A* = access factor (ratio of actual memory traffic to *S* for the kernel). Then:
 
 **Standard path** (explicit copy + kernel on device buffers):
 
-$$
-T_{\mathrm{std}} = L_{\mathrm{overhead}} + \frac{S}{B_{\mathrm{pcie}}} + \frac{S \cdot A}{B_{\mathrm{vram}}}
-$$
+*T_std* = *L_overhead* + *S*/*B_pcie* + (*S* · *A*)/*B_vram*
 
-- \(L_{\mathrm{overhead}}\): launch and sync overhead.
-- \(S/B_{\mathrm{pcie}}\): H2D + D2H transfer time.
-- \(S \cdot A / B_{\mathrm{vram}}\): kernel time (assuming memory-bound).
+- *L_overhead*: launch and sync overhead.
+- *S*/*B_pcie*: H2D + D2H transfer time.
+- *S* · *A* / *B_vram*: kernel time (assuming memory-bound).
 
 **Zero-copy path** (mapped host memory; kernel reads/writes over PCIe):
 
-$$
-T_{\mathrm{zc}} = \frac{S \cdot A}{B_{\mathrm{pcie}} \cdot \eta}
-$$
+*T_zc* = (*S* · *A*) / (*B_pcie* · η)
 
-- \(\eta\): efficiency of access pattern over PCIe (e.g. coalescing, cache effects). Often \(\eta \leq 1\).
+- η: efficiency of access pattern over PCIe (e.g. coalescing, cache effects). Often η ≤ 1.
 
-The **heuristic** measures \(T_{\mathrm{std}}\) and \(T_{\mathrm{zc}}\) at a probe size (e.g. 256K lookups) and chooses zero-copy only when it is **strictly better** than the standard path after a safety margin.
+The **heuristic** measures *T_std* and *T_zc* at a probe size (e.g. 256K lookups) and chooses zero-copy only when it is **strictly better** than the standard path after a safety margin.
 
-### 3.3 Safety Margin (\(\alpha = 0.8\))
+### 3.3 Safety Margin (α = 0.8)
 
 To account for **interconnect jitter** and measurement noise, we switch to zero-copy only if:
 
-$$
-T_{\mathrm{zc}} < \alpha \cdot T_{\mathrm{std}} \qquad (\alpha = 0.8)
-$$
+*T_zc* < α · *T_std*  (α = 0.8)
 
 So zero-copy must be at least **20% faster** than the standard path at the probe size before we set the crossover threshold to prefer it. Otherwise we keep the standard path for typical batch sizes and use zero-copy only for **out-of-core** (batch larger than VRAM capacity).
 
@@ -124,11 +116,11 @@ So zero-copy must be at least **20% faster** than the standard path at the probe
 
 ## 4. Experimental Evaluation
 
-### 4.1 Zipfian distribution (skew \(\alpha\))
+### 4.1 Zipfian distribution (skew α)
 
-Stress tests use a **Zipfian** key distribution (\(P(\mathrm{rank}\,i) \propto 1/(i+1)^\alpha\)). Higher \(\alpha\) increases hot-key contention. Example layout:
+Stress tests use a **Zipfian** key distribution (*P*(rank *i*) ∝ 1/(*i*+1)^α). Higher α increases hot-key contention. Example layout:
 
-| \(\alpha\) (skew) | Insert (ms) | Lookup (ms) | Notes          |
+| α (skew) | Insert (ms) | Lookup (ms) | Notes          |
 |------------------|-------------|-------------|----------------|
 | 0.5              | ...         | ...         | Mild skew      |
 | 1.0              | ...         | ...         | Classic Zipf   |
@@ -154,7 +146,7 @@ This provides an **out-of-core** fallback without changing the API.
 
 ### 4.3 Slab vs CPU baseline (51× speedup)
 
-The **slab-based** variant (warp-cooperative, 128-byte buckets, one atomic per warp) has been measured at up to **51× speedup** over a single-threaded CPU baseline (e.g. \(\texttt{std::unordered\_map}\)) for insert+lookup workloads. Exact numbers depend on batch size, load factor, and hardware; run `./benchmark_vs_cpu` to reproduce.
+The **slab-based** variant (warp-cooperative, 128-byte buckets, one atomic per warp) has been measured at up to **51× speedup** over a single-threaded CPU baseline (e.g. `std::unordered_map`) for insert+lookup workloads. Exact numbers depend on batch size, load factor, and hardware; run `./benchmark_vs_cpu` to reproduce.
 
 ![Heterogeneous speedup: CPU vs GPU Chained vs GPU Slab](scripts/figures/fig3_heterogeneous_speedup.png)  
 *Figure 4: Throughput (ops/sec) for CPU baseline, GPU chained, and GPU slab.*
@@ -242,8 +234,8 @@ hash_map_destroy(&table);
 
 ### PCIe roofline (short)
 
-For zero-copy at \(N = 524{,}288\) lookups (16 B per key+value):  
-\(\mathrm{BW}_{\mathrm{achieved}} = 8.39 / T_{\mathrm{ms}}\) GB/s.  
+For zero-copy at *N* = 524,288 lookups (16 B per key+value):  
+**BW_achieved** = 8.39 / *T_ms* GB/s.  
 If efficiency vs link max (e.g. 16 GB/s Gen3×16) is **> 70%**, the system is **bus-bound**; further gains need better interconnect (e.g. NVLink) or less data movement.
 
 ![PCIe roofline: achieved vs theoretical bandwidth](scripts/figures/fig5_pcie_roofline.png)  
