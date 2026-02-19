@@ -1,0 +1,22 @@
+
+# Consider dependencies only in project.
+set(CMAKE_DEPENDS_IN_PROJECT_ONLY OFF)
+
+# The set of languages for which implicit dependencies are needed:
+set(CMAKE_DEPENDS_LANGUAGES
+  )
+
+# The set of dependency files which are needed:
+set(CMAKE_DEPENDS_DEPENDENCY_FILES
+  "/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/src/analysis/metrics.cu" "CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/metrics.cu.o" "gcc" "CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/metrics.cu.o.d"
+  "/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/src/analysis/probe_depth.cu" "CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/probe_depth.cu.o" "gcc" "CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/probe_depth.cu.o.d"
+  "/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/src/analysis/validation.cu" "CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/validation.cu.o" "gcc" "CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/validation.cu.o.d"
+  "/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/src/analysis/workloads.cpp" "CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/workloads.cpp.o" "gcc" "CMakeFiles/gpu_hashmap_analysis.dir/src/analysis/workloads.cpp.o.d"
+  )
+
+# Targets to which this target links.
+set(CMAKE_TARGET_LINKED_INFO_FILES
+  )
+
+# Fortran module output directory.
+set(CMAKE_Fortran_TARGET_MODULE_DIR "")

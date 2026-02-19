@@ -73,6 +73,8 @@ all: CMakeFiles/test_slab.dir/all
 all: CMakeFiles/benchmark_zerocopy.dir/all
 all: CMakeFiles/benchmark_heuristic.dir/all
 all: CMakeFiles/benchmark_vs_cpu.dir/all
+all: CMakeFiles/benchmark_tail_latency.dir/all
+all: CMakeFiles/benchmark_occupancy.dir/all
 all: CMakeFiles/performance_validation_suite.dir/all
 .PHONY : all
 
@@ -91,6 +93,8 @@ clean: CMakeFiles/test_slab.dir/clean
 clean: CMakeFiles/benchmark_zerocopy.dir/clean
 clean: CMakeFiles/benchmark_heuristic.dir/clean
 clean: CMakeFiles/benchmark_vs_cpu.dir/clean
+clean: CMakeFiles/benchmark_tail_latency.dir/clean
+clean: CMakeFiles/benchmark_occupancy.dir/clean
 clean: CMakeFiles/performance_validation_suite.dir/clean
 .PHONY : clean
 
@@ -101,7 +105,7 @@ clean: CMakeFiles/performance_validation_suite.dir/clean
 CMakeFiles/gpu_hashmap.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/gpu_hashmap.dir/build.make CMakeFiles/gpu_hashmap.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/gpu_hashmap.dir/build.make CMakeFiles/gpu_hashmap.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=11,12,13,14,15,16 "Built target gpu_hashmap"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=16,17,18,19,20,21 "Built target gpu_hashmap"
 .PHONY : CMakeFiles/gpu_hashmap.dir/all
 
 # Build rule for subdir invocation for target.
@@ -127,7 +131,7 @@ CMakeFiles/gpu_hashmap.dir/clean:
 CMakeFiles/gpu_hashmap_slab.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/gpu_hashmap_slab.dir/build.make CMakeFiles/gpu_hashmap_slab.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/gpu_hashmap_slab.dir/build.make CMakeFiles/gpu_hashmap_slab.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=22,23 "Built target gpu_hashmap_slab"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=27,28 "Built target gpu_hashmap_slab"
 .PHONY : CMakeFiles/gpu_hashmap_slab.dir/all
 
 # Build rule for subdir invocation for target.
@@ -153,7 +157,7 @@ CMakeFiles/gpu_hashmap_slab.dir/clean:
 CMakeFiles/gpu_hashmap_analysis.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/gpu_hashmap_analysis.dir/build.make CMakeFiles/gpu_hashmap_analysis.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/gpu_hashmap_analysis.dir/build.make CMakeFiles/gpu_hashmap_analysis.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=17,18,19,20,21 "Built target gpu_hashmap_analysis"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=22,23,24,25,26 "Built target gpu_hashmap_analysis"
 .PHONY : CMakeFiles/gpu_hashmap_analysis.dir/all
 
 # Build rule for subdir invocation for target.
@@ -179,7 +183,7 @@ CMakeFiles/gpu_hashmap_analysis.dir/clean:
 CMakeFiles/test_hashmap.dir/all: CMakeFiles/gpu_hashmap.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_hashmap.dir/build.make CMakeFiles/test_hashmap.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_hashmap.dir/build.make CMakeFiles/test_hashmap.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=26,27 "Built target test_hashmap"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=31,32 "Built target test_hashmap"
 .PHONY : CMakeFiles/test_hashmap.dir/all
 
 # Build rule for subdir invocation for target.
@@ -205,7 +209,7 @@ CMakeFiles/test_hashmap.dir/clean:
 CMakeFiles/benchmark_performance.dir/all: CMakeFiles/gpu_hashmap.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_performance.dir/build.make CMakeFiles/benchmark_performance.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_performance.dir/build.make CMakeFiles/benchmark_performance.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=5,6 "Built target benchmark_performance"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=7,8 "Built target benchmark_performance"
 .PHONY : CMakeFiles/benchmark_performance.dir/all
 
 # Build rule for subdir invocation for target.
@@ -257,7 +261,7 @@ CMakeFiles/benchmark_hybrid.dir/clean:
 CMakeFiles/test_slab.dir/all: CMakeFiles/gpu_hashmap_slab.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_slab.dir/build.make CMakeFiles/test_slab.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_slab.dir/build.make CMakeFiles/test_slab.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=28,29 "Built target test_slab"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=33,34 "Built target test_slab"
 .PHONY : CMakeFiles/test_slab.dir/all
 
 # Build rule for subdir invocation for target.
@@ -283,7 +287,7 @@ CMakeFiles/test_slab.dir/clean:
 CMakeFiles/benchmark_zerocopy.dir/all: CMakeFiles/gpu_hashmap.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_zerocopy.dir/build.make CMakeFiles/benchmark_zerocopy.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_zerocopy.dir/build.make CMakeFiles/benchmark_zerocopy.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=9,10 "Built target benchmark_zerocopy"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=14,15 "Built target benchmark_zerocopy"
 .PHONY : CMakeFiles/benchmark_zerocopy.dir/all
 
 # Build rule for subdir invocation for target.
@@ -336,7 +340,7 @@ CMakeFiles/benchmark_vs_cpu.dir/all: CMakeFiles/gpu_hashmap.dir/all
 CMakeFiles/benchmark_vs_cpu.dir/all: CMakeFiles/gpu_hashmap_slab.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_vs_cpu.dir/build.make CMakeFiles/benchmark_vs_cpu.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_vs_cpu.dir/build.make CMakeFiles/benchmark_vs_cpu.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=7,8 "Built target benchmark_vs_cpu"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=12,13 "Built target benchmark_vs_cpu"
 .PHONY : CMakeFiles/benchmark_vs_cpu.dir/all
 
 # Build rule for subdir invocation for target.
@@ -356,6 +360,59 @@ CMakeFiles/benchmark_vs_cpu.dir/clean:
 .PHONY : CMakeFiles/benchmark_vs_cpu.dir/clean
 
 #=============================================================================
+# Target rules for target CMakeFiles/benchmark_tail_latency.dir
+
+# All Build rule for target.
+CMakeFiles/benchmark_tail_latency.dir/all: CMakeFiles/gpu_hashmap.dir/all
+CMakeFiles/benchmark_tail_latency.dir/all: CMakeFiles/gpu_hashmap_slab.dir/all
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=9,10,11 "Built target benchmark_tail_latency"
+.PHONY : CMakeFiles/benchmark_tail_latency.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/benchmark_tail_latency.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start "/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" 11
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/benchmark_tail_latency.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start "/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" 0
+.PHONY : CMakeFiles/benchmark_tail_latency.dir/rule
+
+# Convenience name for target.
+benchmark_tail_latency: CMakeFiles/benchmark_tail_latency.dir/rule
+.PHONY : benchmark_tail_latency
+
+# clean rule for target.
+CMakeFiles/benchmark_tail_latency.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/clean
+.PHONY : CMakeFiles/benchmark_tail_latency.dir/clean
+
+#=============================================================================
+# Target rules for target CMakeFiles/benchmark_occupancy.dir
+
+# All Build rule for target.
+CMakeFiles/benchmark_occupancy.dir/all: CMakeFiles/gpu_hashmap.dir/all
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_occupancy.dir/build.make CMakeFiles/benchmark_occupancy.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_occupancy.dir/build.make CMakeFiles/benchmark_occupancy.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=5,6 "Built target benchmark_occupancy"
+.PHONY : CMakeFiles/benchmark_occupancy.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/benchmark_occupancy.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start "/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" 8
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/benchmark_occupancy.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start "/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" 0
+.PHONY : CMakeFiles/benchmark_occupancy.dir/rule
+
+# Convenience name for target.
+benchmark_occupancy: CMakeFiles/benchmark_occupancy.dir/rule
+.PHONY : benchmark_occupancy
+
+# clean rule for target.
+CMakeFiles/benchmark_occupancy.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_occupancy.dir/build.make CMakeFiles/benchmark_occupancy.dir/clean
+.PHONY : CMakeFiles/benchmark_occupancy.dir/clean
+
+#=============================================================================
 # Target rules for target CMakeFiles/performance_validation_suite.dir
 
 # All Build rule for target.
@@ -363,7 +420,7 @@ CMakeFiles/performance_validation_suite.dir/all: CMakeFiles/gpu_hashmap.dir/all
 CMakeFiles/performance_validation_suite.dir/all: CMakeFiles/gpu_hashmap_analysis.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/performance_validation_suite.dir/build.make CMakeFiles/performance_validation_suite.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/performance_validation_suite.dir/build.make CMakeFiles/performance_validation_suite.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=24,25 "Built target performance_validation_suite"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir="/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/build/CMakeFiles" --progress-num=29,30 "Built target performance_validation_suite"
 .PHONY : CMakeFiles/performance_validation_suite.dir/all
 
 # Build rule for subdir invocation for target.

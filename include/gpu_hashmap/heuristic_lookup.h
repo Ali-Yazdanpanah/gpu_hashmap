@@ -19,13 +19,19 @@ namespace gpu_hashmap {
 enum class LookupPath { StandardCopy, ZeroCopy };
 
 /**
- * State for the heuristic: crossover threshold, out-of-core fallback, and warm-up flag.
+ * State for the heuristic: crossover threshold, out-of-core fallback, sparsity, and warm-up flag.
  */
 struct HeuristicState {
   size_t crossover_n;           ///< use Zero-Copy when n_lookups >= this (set by warm-up with safety margin)
   size_t max_lookups_fit_vram;  ///< if n > this, force Zero-Copy (out-of-core fallback); set in warm-up
+  size_t table_size_bytes;      ///< if set and large, sparsity mode: prefer Zero-Copy to avoid table migration tax
   bool warmed_up;               ///< true after heuristic_warm_up()
 };
+
+/** Table size above which we consider "massive table" for sparsity-driven crossover (e.g. 2GB). */
+constexpr size_t kSparsityTableSizeThreshold = 1500ULL * 1024 * 1024;
+/** Lookup count below which we consider "sparse" when table is massive (e.g. N=10,000). */
+constexpr size_t kSparsityLookupCap = 100 * 1024;
 
 /** Default crossover from benchmark: 1.29 ms savings at 256k lookups. */
 constexpr size_t kHeuristicDefaultCrossoverN = 256 * 1024;
@@ -36,7 +42,17 @@ constexpr size_t kHeuristicDefaultCrossoverN = 256 * 1024;
 inline void heuristic_init(HeuristicState* state) {
   state->crossover_n = kHeuristicDefaultCrossoverN;
   state->max_lookups_fit_vram = SIZE_MAX;  /* set by warm_up from cudaMemGetInfo */
+  state->table_size_bytes = 0;             /* set by caller for sparsity-driven crossover */
   state->warmed_up = false;
+}
+
+/**
+ * Set table size (bytes) for sparsity-driven crossover. When table is massive and
+ * n_lookups is small, the heuristic will prefer Zero-Copy to avoid the full table
+ * migration tax (Standard path would pay Time(Full Table Copy) before sparse lookups).
+ */
+inline void heuristic_set_table_size(HeuristicState* state, size_t table_bytes) {
+  state->table_size_bytes = table_bytes;
 }
 
 /**
@@ -47,11 +63,17 @@ void heuristic_warm_up(HashTable* table, HeuristicState* state,
                        cudaStream_t stream = nullptr);
 
 /**
- * Choose path for n_lookups: out-of-core forces Zero-Copy; else use crossover_n.
+ * Choose path for n_lookups: sparsity (massive table + sparse lookups) and out-of-core
+ * force Zero-Copy; else use crossover_n. Sparsity: when table_size_bytes is large and
+ * n_lookups is small, Zero-Copy avoids Time(Full Table Copy) > Time(Sparse PCIe Stalls).
  */
 inline LookupPath heuristic_choose_path(size_t n_lookups, HeuristicState const* state) {
   if (n_lookups > state->max_lookups_fit_vram)
     return LookupPath::ZeroCopy;  /* out-of-core fallback: batch does not fit in VRAM */
+  /* Sparsity-driven: massive table + sparse lookups => avoid full table migration tax */
+  if (state->table_size_bytes >= kSparsityTableSizeThreshold &&
+      n_lookups <= kSparsityLookupCap)
+    return LookupPath::ZeroCopy;
   return (n_lookups >= state->crossover_n) ? LookupPath::ZeroCopy : LookupPath::StandardCopy;
 }
 

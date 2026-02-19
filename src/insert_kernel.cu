@@ -48,7 +48,8 @@ __global__ void insert_kernel(HashTableDevice const* table, KeyType const* keys,
   node->key = key;
   node->value = value;
 
-  for (;;) {
+  const int max_cas_retries = 4096;
+  for (int r = 0; r < max_cas_retries; ++r) {
     unsigned long long old_head = table->bucket_heads[b];
     node->next = static_cast<SlotIndex>(old_head);
     __threadfence();

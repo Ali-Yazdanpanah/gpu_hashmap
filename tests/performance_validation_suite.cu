@@ -3,14 +3,21 @@
  * @brief Comprehensive performance analysis & validation suite for academic paper metrics.
  *
  * 1. Memory: Effective BW, load efficiency, occupancy
- * 2. Stress: Zipfian (hot-key), load factor sweep, probe depth
+ * 2. Stress: Zipfian (hot-key), load factor sweep, probe depth, sparsity-driven crossover
  * 3. Multi-GPU: P2P vs host-staged, weak/strong scaling
  * 4. Theoretical: Measured vs peak bandwidth
  * 5. Validation: Gold standard CPU bit-perfect verification
+ *
+ * Sparsity-Driven Crossover (mathematical validation in 2d):
+ *   Time(Full Table Copy) > Time(Sparse PCIe Stalls)
+ * => Zero-Copy chosen to bypass massive table migration tax for sparse lookups.
  */
 
 #include "gpu_hashmap/hash_map_api.h"
+#include "gpu_hashmap/heuristic_lookup.h"
 #include "gpu_hashmap/insert_kernel.cuh"
+#include "gpu_hashmap/lookup_kernel.cuh"
+#include "gpu_hashmap/hash_buckets.cuh"
 #include "gpu_hashmap/analysis/workloads.hpp"
 #include "gpu_hashmap/analysis/metrics.hpp"
 #include "gpu_hashmap/analysis/validation.hpp"
@@ -109,21 +116,9 @@ int main() {
   for (size_t i = 0; i < m_lookup; ++i)
     h_lookup_keys[i] = h_keys[i % n_default];
 
-  // ---------- 5. Validation: Gold standard ----------
-  std::printf("--------------------------------------------------------------------------------\n");
-  std::printf("  5. VALIDATION — Gold standard (bit-perfect vs std::unordered_map)\n");
-  std::printf("--------------------------------------------------------------------------------\n");
   size_t mismatch_idx = 0;
   ValueType expected = 0, got = 0;
-  bool gold_ok = validate_against_cpu_gold(h_keys, h_values, h_lookup_keys,
-                                           num_buckets, capacity,
-                                           &mismatch_idx, &expected, &got);
-  if (gold_ok)
-    std::printf("  Result: PASS — All GPU insert/lookup results match CPU gold.\n");
-  else
-    std::printf("  Result: FAIL — First mismatch at index %zu (expected %llu, got %llu).\n",
-                (size_t)mismatch_idx, (unsigned long long)expected, (unsigned long long)got);
-  std::printf("\n");
+  bool gold_ok = true;
 
   // ---------- 1. Memory architecture metrics ----------
   std::printf("--------------------------------------------------------------------------------\n");
@@ -287,6 +282,109 @@ int main() {
               count_miss > 0 ? sum_miss / count_miss : 0, count_miss);
   CUDA_CHECK(cudaFree(d_depth));
 
+  // ---------- 2d. Sparsity-Driven Crossover (massive table + N=10,000) ----------
+  /*
+   * Crossover occurs when: Time(Full Table Copy) > Time(Sparse PCIe Stalls).
+   * Standard path: full table H2D + keys H2D + kernel + results D2H (Copy Tax).
+   * Zero-Copy path: table in mapped memory; GPU fetches only needed buckets over PCIe.
+   */
+  std::printf("--------------------------------------------------------------------------------\n");
+  std::printf("  2d. SPARSITY-DRIVEN CROSSOVER (Massive Table + Sparse Lookups)\n");
+  std::printf("--------------------------------------------------------------------------------\n");
+  size_t free_vram_s = 0, total_vram_s = 0;
+  CUDA_CHECK(cudaMemGetInfo(&free_vram_s, &total_vram_s));
+  const size_t two_gb_s = 2ULL * 1024 * 1024 * 1024;
+  const size_t target_bytes = (two_gb_s < (size_t)((double)free_vram_s * 0.8)) ? two_gb_s : (size_t)((double)free_vram_s * 0.8);
+  const size_t nb_sparse = 1 << 21;
+  const size_t cap_sparse = (target_bytes - nb_sparse * sizeof(unsigned long long)) / sizeof(gpu_hashmap::Node);
+  if (cap_sparse > 1024 * 1024) {
+    const size_t table_bytes = nb_sparse * sizeof(unsigned long long) + cap_sparse * sizeof(gpu_hashmap::Node);
+    /* Cap n_fill so hash_map_upload_from_host stays fast; large capacity alone gives migration tax. */
+    const size_t n_fill_cap = 128 * 1024;
+    const size_t n_fill = (cap_sparse / 40 > n_fill_cap) ? n_fill_cap : (cap_sparse / 40);
+    std::printf("  Massive table: %.2f GB; fill %zu entries; sparse N = 10,000\n",
+                table_bytes / (1024.0 * 1024.0 * 1024.0), n_fill);
+
+    gpu_hashmap::HashTable tab_sparse = {};
+    hash_map_create(&tab_sparse, nb_sparse, cap_sparse);
+    std::vector<KeyType> h_fill_k(n_fill), h_sparse_k(10000);
+    std::vector<ValueType> h_fill_v(n_fill);
+    fill_uniform_keys_values(h_fill_k, h_fill_v, n_fill, 12345);
+    for (size_t i = 0; i < 10000; ++i) h_sparse_k[i] = h_fill_k[i % n_fill];
+    hash_map_upload_from_host(&tab_sparse, h_fill_k.data(), h_fill_v.data(), n_fill);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    const unsigned int pin_f = cudaHostAllocMapped | cudaHostAllocPortable;
+    KeyType* h_pin_k = nullptr;
+    ValueType* h_pin_v = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&h_pin_k, 10000 * sizeof(KeyType), pin_f));
+    CUDA_CHECK(cudaHostAlloc(&h_pin_v, 10000 * sizeof(ValueType), pin_f));
+    for (size_t i = 0; i < 10000; ++i) h_pin_k[i] = h_sparse_k[i];
+
+    void* d_h = nullptr, *d_n = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_h, nb_sparse * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&d_n, cap_sparse * sizeof(gpu_hashmap::Node)));
+    cudaEvent_t se1, se2;
+    CUDA_CHECK(cudaEventCreate(&se1));
+    CUDA_CHECK(cudaEventCreate(&se2));
+    CUDA_CHECK(cudaEventRecord(se1));
+    CUDA_CHECK(cudaMemcpy(d_h, tab_sparse.h_bucket_heads, nb_sparse * sizeof(unsigned long long), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_n, tab_sparse.h_nodes, cap_sparse * sizeof(gpu_hashmap::Node), cudaMemcpyHostToDevice));
+    gpu_hashmap::HashTableDevice h_dev = {};
+    h_dev.bucket_heads = static_cast<unsigned long long*>(d_h);
+    h_dev.nodes = static_cast<gpu_hashmap::Node*>(d_n);
+    h_dev.slab = tab_sparse.device.slab;
+    h_dev.num_buckets = nb_sparse;
+    h_dev.capacity = cap_sparse;
+    gpu_hashmap::HashTableDevice* d_tab = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_tab, sizeof(gpu_hashmap::HashTableDevice)));
+    CUDA_CHECK(cudaMemcpy(d_tab, &h_dev, sizeof(gpu_hashmap::HashTableDevice), cudaMemcpyHostToDevice));
+    KeyType* d_k = nullptr;
+    ValueType* d_v = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_k, 10000 * sizeof(KeyType)));
+    CUDA_CHECK(cudaMalloc(&d_v, 10000 * sizeof(ValueType)));
+    CUDA_CHECK(cudaMemcpy(d_k, h_pin_k, 10000 * sizeof(KeyType), cudaMemcpyHostToDevice));
+    gpu_hashmap::hash_map_lookup_kernel<<<(10000 + 255) / 256, 256>>>(d_tab, d_k, d_v, 10000);
+    CUDA_CHECK(cudaMemcpy(h_pin_v, d_v, 10000 * sizeof(ValueType), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaEventRecord(se2));
+    CUDA_CHECK(cudaEventSynchronize(se2));
+    float std_migration_ms = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&std_migration_ms, se1, se2));
+    std::printf("  Standard (full table copy + lookup): %.3f ms\n", std_migration_ms);
+    CUDA_CHECK(cudaFree(d_tab));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_h));
+    CUDA_CHECK(cudaFree(d_n));
+    CUDA_CHECK(cudaEventDestroy(se1));
+    CUDA_CHECK(cudaEventDestroy(se2));
+
+    CUDA_CHECK(cudaEventCreate(&se1));
+    CUDA_CHECK(cudaEventCreate(&se2));
+    CUDA_CHECK(cudaEventRecord(se1));
+    hash_map_lookup_batch_zero_copy(&tab_sparse, h_pin_k, h_pin_v, 10000);
+    CUDA_CHECK(cudaEventRecord(se2));
+    CUDA_CHECK(cudaEventSynchronize(se2));
+    float zc_ms = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&zc_ms, se1, se2));
+    std::printf("  Zero-Copy (no table migration):      %.3f ms\n", zc_ms);
+    CUDA_CHECK(cudaEventDestroy(se1));
+    CUDA_CHECK(cudaEventDestroy(se2));
+
+    gpu_hashmap::HeuristicState h_state = {};
+    heuristic_init(&h_state);
+    heuristic_set_table_size(&h_state, table_bytes);
+    std::printf("  Heuristic: ");
+    hash_map_lookup_batch_heuristic(&tab_sparse, h_pin_k, h_pin_v, 10000, &h_state);
+
+    CUDA_CHECK(cudaFreeHost(h_pin_k));
+    CUDA_CHECK(cudaFreeHost(h_pin_v));
+    hash_map_destroy(&tab_sparse);
+  } else {
+    std::printf("  Skipped (insufficient VRAM for massive table).\n");
+  }
+  std::printf("\n");
+
   // ---------- 3. Multi-GPU (if available) ----------
   std::printf("--------------------------------------------------------------------------------\n");
   std::printf("  3. MULTI-GPU & DISTRIBUTED ANALYTICS\n");
@@ -296,6 +394,12 @@ int main() {
   if (ndev < 2) {
     std::printf("  Skipped (single GPU). Need 2+ GPUs for P2P and scaling.\n\n");
   } else {
+    int can_access_01 = 0, can_access_10 = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_01, 1, 0));
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_10, 0, 1));
+    if (!can_access_01 || !can_access_10) {
+      std::printf("  Skipped (P2P not enabled between GPU 0 and 1). Run with cudaDeviceEnablePeerAccess or skip.\n\n");
+    } else {
     const size_t transfer_size = 64 * 1024 * 1024;
     void* d0 = nullptr, *d1 = nullptr;
     CUDA_CHECK(cudaSetDevice(0));
@@ -307,7 +411,7 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&pe2));
     CUDA_CHECK(cudaEventRecord(pe1));
     for (int rep = 0; rep < 10; ++rep)
-      cudaMemcpyPeer(d1, 1, d0, 0, transfer_size);
+      CUDA_CHECK(cudaMemcpyPeer(d1, 1, d0, 0, transfer_size));
     CUDA_CHECK(cudaEventRecord(pe2));
     CUDA_CHECK(cudaEventSynchronize(pe2));
     float p2p_ms = 0;
@@ -447,6 +551,7 @@ int main() {
     CUDA_CHECK(cudaFree(d0));
     CUDA_CHECK(cudaSetDevice(1));
     CUDA_CHECK(cudaFree(d1));
+    }
   }
 
   // ---------- 4. Theoretical comparison ----------
@@ -463,6 +568,20 @@ int main() {
   CUDA_CHECK(cudaFree(d_lookup_keys));
   CUDA_CHECK(cudaFree(d_lookup_out));
   hash_map_destroy(&table);
+
+  // ---------- 5. Validation: Gold standard (run last to avoid long CPU work before GPU metrics) ----------
+  std::printf("--------------------------------------------------------------------------------\n");
+  std::printf("  5. VALIDATION — Gold standard (bit-perfect vs std::unordered_map)\n");
+  std::printf("--------------------------------------------------------------------------------\n");
+  gold_ok = validate_against_cpu_gold(h_keys, h_values, h_lookup_keys,
+                                      num_buckets, capacity,
+                                      &mismatch_idx, &expected, &got);
+  if (gold_ok)
+    std::printf("  Result: PASS — All GPU insert/lookup results match CPU gold.\n");
+  else
+    std::printf("  Result: FAIL — First mismatch at index %zu (expected %llu, got %llu).\n",
+                (size_t)mismatch_idx, (unsigned long long)expected, (unsigned long long)got);
+  std::printf("\n");
 
   std::printf("================================================================================\n");
   std::printf("  Suite complete. Use Nsight Compute for exact load efficiency.\n");

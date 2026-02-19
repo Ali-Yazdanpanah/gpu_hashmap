@@ -1,0 +1,2 @@
+/usr/bin/ar qc libgpu_hashmap.a CMakeFiles/gpu_hashmap.dir/src/slab_allocator.cu.o CMakeFiles/gpu_hashmap.dir/src/insert_kernel.cu.o CMakeFiles/gpu_hashmap.dir/src/hash_map_api.cu.o CMakeFiles/gpu_hashmap.dir/src/lookup_api.cu.o CMakeFiles/gpu_hashmap.dir/src/heuristic_lookup.cu.o
+/usr/bin/ranlib libgpu_hashmap.a

@@ -45,6 +45,21 @@ __global__ void lookup_kernel_chained(gpu_hashmap::HashTableDevice const* table,
   values[i] = 0xFFFFFFFFFFFFFFFFull;
 }
 
+static int compare_double(const void* a, const void* b) {
+  double x = *(const double*)a;
+  double y = *(const double*)b;
+  return (x > y) ? 1 : (x < y) ? -1 : 0;
+}
+
+static double percentile_from_sorted(const double* sorted, size_t len, double p) {
+  if (len == 0) return 0.0;
+  double idx = p * (len - 1) / 100.0;
+  size_t i = (size_t)idx;
+  if (i >= len - 1) return sorted[len - 1];
+  double frac = idx - (double)i;
+  return sorted[i] * (1.0 - frac) + sorted[i + 1] * frac;
+}
+
 void run_cpu(std::vector<gpu_hashmap::KeyType> const& h_keys,
              std::vector<gpu_hashmap::ValueType> const& h_values,
              std::vector<gpu_hashmap::KeyType> const& h_lookup_keys,
@@ -69,6 +84,31 @@ void run_cpu(std::vector<gpu_hashmap::KeyType> const& h_keys,
   t1 = std::chrono::high_resolution_clock::now();
   *out_lookup_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
   (void)results;
+}
+
+void run_cpu_latency_distribution(std::vector<gpu_hashmap::KeyType> const& h_keys,
+                                   std::vector<gpu_hashmap::ValueType> const& h_values,
+                                   std::vector<gpu_hashmap::KeyType> const& h_lookup_keys,
+                                   double* out_p50_us, double* out_p90_us, double* out_p99_us) {
+  const size_t n = h_keys.size();
+  const size_t m = h_lookup_keys.size();
+  std::unordered_map<uint64_t, uint64_t> map;
+  map.reserve(n);
+  for (size_t i = 0; i < n; ++i)
+    map[h_keys[i]] = h_values[i];
+
+  std::vector<double> latencies_us(m);
+  for (size_t i = 0; i < m; ++i) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto it = map.find(h_lookup_keys[i]);
+    (void)(it != map.end() ? it->second : 0xFFFFFFFFFFFFFFFFull);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    latencies_us[i] = std::chrono::duration<double, std::micro>(t1 - t0).count();
+  }
+  qsort(latencies_us.data(), m, sizeof(double), compare_double);
+  *out_p50_us = percentile_from_sorted(latencies_us.data(), m, 50.0);
+  *out_p90_us = percentile_from_sorted(latencies_us.data(), m, 90.0);
+  *out_p99_us = percentile_from_sorted(latencies_us.data(), m, 99.0);
 }
 
 void run_gpu_chained(size_t num_buckets, size_t capacity,
@@ -292,6 +332,12 @@ int main() {
   double hybrid_build = 0, hybrid_lup = 0;
 
   run_cpu(h_keys, h_values, h_lookup_keys, &cpu_ins, &cpu_lup);
+
+  double cpu_p50_us = 0, cpu_p90_us = 0, cpu_p99_us = 0;
+  run_cpu_latency_distribution(h_keys, h_values, h_lookup_keys, &cpu_p50_us, &cpu_p90_us, &cpu_p99_us);
+  std::printf("  CPU per-find latency (µs):  P50= %8.2f   P90= %8.2f   P99= %8.2f\n\n",
+              cpu_p50_us, cpu_p90_us, cpu_p99_us);
+
   run_gpu_chained(num_buckets, capacity, h_keys, h_values, h_lookup_keys, &gpu_chain_ins, &gpu_chain_lup);
   run_gpu_warp_agg(num_buckets, capacity, h_keys, h_values, h_lookup_keys, &gpu_warp_ins, &gpu_warp_lup);
   run_gpu_slab(num_buckets, h_keys, h_values, h_lookup_keys, &gpu_slab_ins, &gpu_slab_lup);

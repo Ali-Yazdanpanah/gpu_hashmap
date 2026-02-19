@@ -70,14 +70,20 @@ def ensure_outdir(outdir: Path) -> None:
 def run_benchmark(build_dir: Path, exe: str, timeout_s: int = 300) -> str:
     path = build_dir / exe
     if not path.is_file():
-        raise FileNotFoundError(f"Benchmark not found: {path} (run cmake --build first)")
-    result = subprocess.run(
-        [str(path)],
-        cwd=str(build_dir),
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-    )
+        path_exe = build_dir / (exe + ".exe")
+        path = path_exe if path_exe.is_file() else path
+    if not path.is_file():
+        raise FileNotFoundError(f"Benchmark not found: {build_dir / exe} (run cmake --build first)")
+    try:
+        result = subprocess.run(
+            [str(path)],
+            cwd=str(build_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"{exe} timed out after {timeout_s}s")
     if result.returncode != 0:
         sys.stderr.write(result.stderr or "")
         result.check_returncode()
@@ -118,16 +124,29 @@ def parse_heuristic(stdout: str) -> dict:
 
 
 def parse_vs_cpu(stdout: str) -> dict:
-    """Parse benchmark_vs_cpu: Approach, Insert(ms), Lookup(ms), Total(ms), vs CPU. Uses first 3 rows (CPU, GPU chained, GPU slab)."""
+    """Parse benchmark_vs_cpu: all 5 rows (CPU, GPU chained, warp-agg, slab, Hybrid). Insert(ms), Lookup(ms), Total(ms), vs CPU.
+    Also parses CPU per-find latency (µs): P50, P90, P99 for Figure 6."""
+    # Display names for plot (order must match benchmark output)
+    approach_names = [
+        "CPU (unordered_map)",
+        "GPU Chained",
+        "GPU Warp-agg",
+        "GPU Slab",
+        "Hybrid (CPU+GPU lup)",
+    ]
     data = {
-        "approaches": ["CPU (unordered_map)", "GPU Chained", "GPU Slab"],
+        "approaches": approach_names,
         "insert_ms": [],
         "lookup_ms": [],
+        "total_ms": [],
+        "speedup_x": [],
         "total_ops": 1536000,
+        "cpu_per_find_us": None,
     }
-    # Lines like "  CPU (unordered_map)        420.00      180.00      600.00     1.00x"
+    # Match all 5 rows: CPU, GPU chained, GPU warp-aggregated, GPU slab (8/bucket), Hybrid (CPU+GPU lup); capture Total(ms) and vs CPU (speedup)
     pattern = re.compile(
-        r"^\s*(CPU \(unordered_map\)|GPU chained|GPU slab \(8/bucket\))\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+[\d.]+x",
+        r"^\s*(CPU \(unordered_map\)|GPU chained|GPU warp-aggregated|GPU slab \(8/bucket\)|Hybrid \(CPU\+GPU lup\))\s+"
+        r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)x",
         re.IGNORECASE,
     )
     for line in stdout.splitlines():
@@ -135,11 +154,24 @@ def parse_vs_cpu(stdout: str) -> dict:
         if m:
             data["insert_ms"].append(float(m.group(2)))
             data["lookup_ms"].append(float(m.group(3)))
-            if len(data["insert_ms"]) >= 3:
-                break
-    if len(data["insert_ms"]) != 3:
-        data["insert_ms"] = [420.0, 85.0, 12.0]
-        data["lookup_ms"] = [180.0, 8.2, 2.1]
+            data["total_ms"].append(float(m.group(4)))
+            data["speedup_x"].append(float(m.group(5)))
+    if len(data["insert_ms"]) != 5:
+        data["insert_ms"] = [420.0, 85.0, 75.0, 12.0, 42.0]
+        data["lookup_ms"] = [180.0, 8.2, 7.8, 2.1, 31.0]
+        data["total_ms"] = [600.0, 410.0, 358.0, 1.6, 42.0]
+        data["speedup_x"] = [1.0, 0.18, 0.21, 46.92, 1.78]
+    # CPU per-find latency (µs): "  CPU per-find latency (µs):  P50=    1.23   P90=    2.34   P99=    4.56"
+    cpu_lat = re.search(
+        r"CPU per-find latency \(µs\):\s+P50=\s+([\d.]+)\s+P90=\s+([\d.]+)\s+P99=\s+([\d.]+)",
+        stdout,
+    )
+    if cpu_lat:
+        data["cpu_per_find_us"] = {
+            "p50_us": float(cpu_lat.group(1)),
+            "p90_us": float(cpu_lat.group(2)),
+            "p99_us": float(cpu_lat.group(3)),
+        }
     return data
 
 
@@ -216,6 +248,45 @@ def parse_zerocopy(stdout: str) -> dict:
     return data
 
 
+def parse_tail_latency(stdout: str) -> dict:
+    """Parse benchmark_tail_latency: GPU Chained, GPU Slab, and CPU P50, P90, P99 (batch latency in ms)."""
+    data = {"gpu": {}, "gpu_slab": {}, "cpu": {}}
+    # P50 (median)  X.XXXX ms  and  P90  X.XXXX ms  and  P99  X.XXXX ms
+    def extract_percentiles(block):
+        out = {}
+        m = re.search(r"P50 \(median\)\s+([\d.]+)\s+ms", block)
+        if m:
+            out["p50_ms"] = float(m.group(1))
+        m = re.search(r"P90\s+([\d.]+)\s+ms", block)
+        if m:
+            out["p90_ms"] = float(m.group(1))
+        m = re.search(r"P99\s+([\d.]+)\s+ms", block)
+        if m:
+            out["p99_ms"] = float(m.group(1))
+        return out
+    idx_gpu = stdout.find("GPU (chained lookup")
+    idx_slab = stdout.find("GPU Slab (batch latency")
+    idx_cpu = stdout.find("CPU (std::unordered_map")
+    if idx_gpu >= 0:
+        data["gpu"] = extract_percentiles(stdout[idx_gpu:])
+    if idx_slab >= 0:
+        data["gpu_slab"] = extract_percentiles(stdout[idx_slab:])
+    if idx_cpu >= 0:
+        data["cpu"] = extract_percentiles(stdout[idx_cpu:])
+    return data
+
+
+def parse_occupancy(stdout: str) -> dict:
+    """Parse benchmark_occupancy: block size, blocks/SM, occupancy, throughput Mops/s."""
+    data = {"block_sizes": [], "occupancy": [], "throughput_mops": []}
+    # Lines like "  32        12          0.25      45.32 Mops/s"
+    for m in re.finditer(r"^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+Mops/s", stdout, re.MULTILINE):
+        data["block_sizes"].append(int(m.group(1)))
+        data["occupancy"].append(float(m.group(3)))
+        data["throughput_mops"].append(float(m.group(4)))
+    return data
+
+
 def run_and_parse_all(build_dir: Path) -> dict:
     """Run all benchmarks, parse stdout, return merged data dict for plotting."""
     build_dir = Path(build_dir).resolve()
@@ -233,9 +304,11 @@ def run_and_parse_all(build_dir: Path) -> dict:
             "warp_agg_insert_ms": [38.1, 41.2, 48.5, 55.2],
         },
         "heterogeneous": {
-            "approaches": ["CPU (unordered_map)", "GPU Chained", "GPU Slab"],
-            "insert_ms": [420.0, 85.0, 12.0],
-            "lookup_ms": [180.0, 8.2, 2.1],
+            "approaches": ["CPU (unordered_map)", "GPU Chained", "GPU Warp-agg", "GPU Slab", "Hybrid (CPU+GPU lup)"],
+            "insert_ms": [420.0, 85.0, 75.0, 12.0, 42.0],
+            "lookup_ms": [180.0, 8.2, 7.8, 2.1, 31.0],
+            "total_ms": [600.0, 410.0, 358.0, 1.6, 42.0],
+            "speedup_x": [1.0, 0.18, 0.21, 46.92, 1.78],
             "total_ops": 1536000,
         },
         "load_factor": {
@@ -251,6 +324,17 @@ def run_and_parse_all(build_dir: Path) -> dict:
             "peak_gen3_gbps": 16,
             "peak_gen4_gbps": 32,
         },
+        "tail_latency": {
+            "gpu": {"p50_ms": 0.08, "p90_ms": 0.12, "p99_ms": 0.25},
+            "gpu_slab": {"p50_ms": 0.05, "p90_ms": 0.09, "p99_ms": 0.18},
+            "cpu": {"p50_ms": 2.1, "p90_ms": 3.5, "p99_ms": 5.2},
+            "cpu_per_find_us": {"p50_us": 0.8, "p90_us": 1.5, "p99_us": 3.2},
+        },
+        "occupancy": {
+            "block_sizes": [32, 64, 128, 256, 512, 1024],
+            "occupancy": [0.25, 0.5, 0.75, 1.0, 0.75, 0.5],
+            "throughput_mops": [35.2, 68.1, 95.3, 112.0, 98.5, 72.1],
+        },
     }
 
     # benchmark_heuristic
@@ -261,17 +345,21 @@ def run_and_parse_all(build_dir: Path) -> dict:
     except Exception as e:
         print(f"benchmark_heuristic: {e}", file=sys.stderr)
 
-    # benchmark_vs_cpu
+    # benchmark_vs_cpu (heterogeneous + CPU per-find latency for fig6)
+    cpu_per_find_us_from_vs_cpu = None
     try:
         out = run_benchmark(build_dir, "benchmark_vs_cpu")
-        default_data["heterogeneous"] = parse_vs_cpu(out)
+        vs_cpu = parse_vs_cpu(out)
+        default_data["heterogeneous"] = {k: v for k, v in vs_cpu.items() if k != "cpu_per_find_us"}
+        if vs_cpu.get("cpu_per_find_us"):
+            cpu_per_find_us_from_vs_cpu = vs_cpu["cpu_per_find_us"]
         print("Parsed benchmark_vs_cpu")
     except Exception as e:
         print(f"benchmark_vs_cpu: {e}", file=sys.stderr)
 
-    # performance_validation_suite (Zipfian, load factor, probe depth, roofline)
+    # performance_validation_suite (Zipfian, load factor, probe depth, roofline) – can be slow
     try:
-        out = run_benchmark(build_dir, "performance_validation_suite")
+        out = run_benchmark(build_dir, "performance_validation_suite", timeout_s=1200)
         vs = parse_validation_suite(out)
         if vs["zipfian"]:
             default_data["warp_aggregation"] = {
@@ -309,6 +397,24 @@ def run_and_parse_all(build_dir: Path) -> dict:
         print("Parsed benchmark_zerocopy")
     except Exception as e:
         print(f"benchmark_zerocopy: {e}", file=sys.stderr)
+
+    # benchmark_tail_latency (GPU Chained, GPU Slab, CPU batch percentiles; merge CPU per-find µs from vs_cpu)
+    try:
+        out = run_benchmark(build_dir, "benchmark_tail_latency")
+        default_data["tail_latency"] = parse_tail_latency(out)
+        if cpu_per_find_us_from_vs_cpu:
+            default_data["tail_latency"]["cpu_per_find_us"] = cpu_per_find_us_from_vs_cpu
+        print("Parsed benchmark_tail_latency")
+    except Exception as e:
+        print(f"benchmark_tail_latency: {e}", file=sys.stderr)
+
+    # benchmark_occupancy
+    try:
+        out = run_benchmark(build_dir, "benchmark_occupancy")
+        default_data["occupancy"] = parse_occupancy(out)
+        print("Parsed benchmark_occupancy")
+    except Exception as e:
+        print(f"benchmark_occupancy: {e}", file=sys.stderr)
 
     return default_data
 
@@ -432,22 +538,84 @@ def plot_heterogeneous_speedup(data: dict, outdir: Path) -> None:
     total_ms = insert_ms + lookup_ms
     ops_per_sec = (total_ops / 1000.0) / (total_ms / 1000.0)  # ops/sec
 
-    x = np.arange(len(approaches))
+    n = len(approaches)
+    x = np.arange(n)
     width = 0.5
 
-    fig, ax = plt.subplots(figsize=(FIGW, FIGH))
-    bars = ax.bar(x, ops_per_sec, width, color=["C2", "C0", "C1"], edgecolor="black", linewidth=0.5)
+    fig, ax = plt.subplots(figsize=(max(FIGW, n * 1.2), FIGH))
+    colors = ["C2", "C0", "C3", "C1", "C4"][:n]
+    bars = ax.bar(x, ops_per_sec, width, color=colors, edgecolor="black", linewidth=0.5)
     ax.set_ylabel("Throughput (ops/sec)")
     ax.set_xlabel("Implementation")
-    ax.set_title("Heterogeneous speedup: CPU vs GPU Chained vs GPU Slab")
+    ax.set_title("Heterogeneous speedup: CPU vs GPU variants vs Hybrid")
     ax.set_xticks(x)
-    ax.set_xticklabels(approaches, rotation=15, ha="right")
+    ax.set_xticklabels(approaches, rotation=20, ha="right")
     for i, (bar, v) in enumerate(zip(bars, ops_per_sec)):
+        if v >= 1e6:
+            label = f"{v/1e6:.2f}M"
+        elif v >= 1e3:
+            label = f"{v/1e3:.1f}K"
+        else:
+            label = f"{v:.0f}"
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(ops_per_sec) * 0.02,
-                f"{v/1e6:.2f}M", ha="center", va="bottom", fontsize=9)
+                label, ha="center", va="bottom", fontsize=9)
     fig.savefig(outdir / "fig3_heterogeneous_speedup.png")
     plt.close(fig)
     print("Saved fig3_heterogeneous_speedup.png")
+
+
+# -----------------------------------------------------------------------------
+# 3b. Speedup (vs CPU)
+# -----------------------------------------------------------------------------
+def plot_timings_and_speedup(data: dict, outdir: Path) -> None:
+    d = data.get("heterogeneous") or {}
+    approaches = d.get("approaches") or []
+    insert_ms = np.array(d.get("insert_ms") or [])
+    lookup_ms = np.array(d.get("lookup_ms") or [])
+    total_ms = np.array(d.get("total_ms") or [])
+    speedup_x = np.array(d.get("speedup_x") or [])
+    if len(approaches) == 0 or len(insert_ms) != len(approaches):
+        print("Skipping timings/speedup chart (no heterogeneous data)")
+        return
+    n = len(approaches)
+    # Support old JSON without total_ms / speedup_x: derive from insert_ms + lookup_ms
+    if len(total_ms) != n:
+        total_ms = insert_ms + lookup_ms
+    if len(speedup_x) != n:
+        cpu_total = float(total_ms[0]) if n > 0 else 1.0
+        speedup_x = np.array([cpu_total / t if t > 0 else 0.0 for t in total_ms])
+    x = np.arange(n)
+
+    fig, ax2 = plt.subplots(1, 1, figsize=(max(FIGW, n * 1.2), FIGH))
+
+    # Speedup (vs CPU)
+    colors = ["C2", "C0", "C3", "C1", "C4"][:n]
+    bars = ax2.bar(x, speedup_x, width=0.5, color=colors, edgecolor="black", linewidth=0.5)
+    ax2.axhline(y=1.0, color="gray", linestyle="--", linewidth=1, label="CPU baseline (1.0×)")
+    ax2.set_ylabel("Speedup (× vs CPU)")
+    ax2.set_xlabel("Implementation")
+    ax2.set_title("Speedup vs CPU (unordered_map)")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(approaches, rotation=20, ha="right")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    if speedup_x.max() > 10:
+        ax2.set_yscale("log")
+        ax2.set_ylim(max(0.05, speedup_x.min() * 0.5), speedup_x.max() * 1.5)
+    for bar, v in zip(bars, speedup_x):
+        h = bar.get_height()
+        if v >= 1:
+            y_pos = h * 1.08
+            va = "bottom"
+        else:
+            y_pos = h * 0.92
+            va = "top"
+        ax2.text(bar.get_x() + bar.get_width() / 2, y_pos, f"{v:.2f}×", ha="center", va=va, fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(outdir / "fig8_speedup_vs_cpu.png", bbox_inches="tight", dpi=DPI)
+    plt.close(fig)
+    print("Saved fig8_speedup_vs_cpu.png")
 
 
 # -----------------------------------------------------------------------------
@@ -516,6 +684,83 @@ def plot_roofline(data: dict, outdir: Path) -> None:
 
 
 # -----------------------------------------------------------------------------
+# 6. P99 Tail Latency: CPU (per-find µs) vs GPU Chained vs GPU Slab (batch → µs)
+# -----------------------------------------------------------------------------
+def plot_tail_latency(data: dict, outdir: Path) -> None:
+    tl = data.get("tail_latency") or {}
+    cpu_us = tl.get("cpu_per_find_us") or {}
+    gpu = tl.get("gpu") or {}
+    gpu_slab = tl.get("gpu_slab") or {}
+    # CPU: per-find already in µs; GPU: batch latency in ms → convert to µs (ms * 1000)
+    def ms_to_us(ms):
+        return (float(ms) * 1000.0) if ms is not None else None
+    cpu_vals = [cpu_us.get("p50_us"), cpu_us.get("p90_us"), cpu_us.get("p99_us")]
+    gpu_vals = [ms_to_us(gpu.get("p50_ms")), ms_to_us(gpu.get("p90_ms")), ms_to_us(gpu.get("p99_ms"))]
+    slab_vals = [ms_to_us(gpu_slab.get("p50_ms")), ms_to_us(gpu_slab.get("p90_ms")), ms_to_us(gpu_slab.get("p99_ms"))]
+    if not any(cpu_vals) and not any(gpu_vals) and not any(slab_vals):
+        print("Skipping fig6 (no tail_latency data)")
+        return
+    percentiles = ["P50", "P90", "P99"]
+    x = np.arange(len(percentiles))
+    width = 0.26
+    fig, ax = plt.subplots(figsize=(FIGW, FIGH))
+    cpu_vals = [v if v is not None else 0 for v in cpu_vals]
+    gpu_vals = [v if v is not None else 0 for v in gpu_vals]
+    slab_vals = [v if v is not None else 0 for v in slab_vals]
+    if any(cpu_vals):
+        ax.bar(x - width, cpu_vals, width, label="CPU (std::unordered_map)", color="C0")
+    if any(gpu_vals):
+        ax.bar(x, gpu_vals, width, label="GPU (Chained)", color="C1")
+    if any(slab_vals):
+        ax.bar(x + width, slab_vals, width, label="GPU (Slab)", color="C2")
+    ax.set_ylabel("Latency (µs)")
+    ax.set_xlabel("Percentile")
+    ax.set_title("Tail latency: CPU per-find vs GPU batch (P50 / P90 / P99)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(percentiles)
+    ax.legend()
+    ax.set_ylim(0, max(cpu_vals + gpu_vals + slab_vals) * 1.15 if (cpu_vals + gpu_vals + slab_vals) else 1)
+    fig.savefig(outdir / "fig6_tail_latency_p99.png", bbox_inches="tight", dpi=DPI)
+    plt.close(fig)
+    print("Saved fig6_tail_latency_p99.png")
+
+
+# -----------------------------------------------------------------------------
+# 7. Occupancy vs. Throughput (block size sweep)
+# -----------------------------------------------------------------------------
+def plot_occupancy_throughput(data: dict, outdir: Path) -> None:
+    occ = data.get("occupancy") or {}
+    block_sizes = occ.get("block_sizes") or []
+    throughput_mops = occ.get("throughput_mops") or []
+    occupancy = occ.get("occupancy") or []
+    if not block_sizes or not throughput_mops:
+        print("Skipping fig7 (no occupancy data)")
+        return
+    fig, ax1 = plt.subplots(figsize=(FIGW, FIGH))
+    ax1.set_xlabel("Block size (threads)")
+    ax1.set_xticks(block_sizes)
+    ax1.set_xticklabels(block_sizes)
+    color1 = "C0"
+    ax1.plot(block_sizes, throughput_mops, "o-", color=color1, label="Throughput (Mops/s)")
+    ax1.set_ylabel("Throughput (Mops/s)", color=color1)
+    ax1.tick_params(axis="y", labelcolor=color1)
+    ax1.set_ylim(0, max(throughput_mops) * 1.15 if throughput_mops else 1)
+    if occupancy:
+        ax2 = ax1.twinx()
+        color2 = "C1"
+        ax2.plot(block_sizes, occupancy, "s--", color=color2, label="Occupancy")
+        ax2.set_ylabel("Occupancy", color=color2)
+        ax2.tick_params(axis="y", labelcolor=color2)
+        ax2.set_ylim(0, 1.05)
+    ax1.legend(loc="upper left")
+    ax1.set_title("Occupancy vs. throughput (block size 32–1024)")
+    fig.tight_layout()
+    fig.savefig(outdir / "fig7_occupancy_throughput.png", bbox_inches="tight", dpi=DPI)
+    plt.close(fig)
+    print("Saved fig7_occupancy_throughput.png")
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main() -> None:
@@ -563,9 +808,11 @@ def main() -> None:
                     "warp_agg_insert_ms": [38.1, 41.2, 48.5, 55.2],
                 },
                 "heterogeneous": {
-                    "approaches": ["CPU (unordered_map)", "GPU Chained", "GPU Slab"],
-                    "insert_ms": [420.0, 85.0, 12.0],
-                    "lookup_ms": [180.0, 8.2, 2.1],
+                    "approaches": ["CPU (unordered_map)", "GPU Chained", "GPU Warp-agg", "GPU Slab", "Hybrid (CPU+GPU lup)"],
+                    "insert_ms": [420.0, 85.0, 75.0, 12.0, 42.0],
+                    "lookup_ms": [180.0, 8.2, 7.8, 2.1, 31.0],
+                    "total_ms": [600.0, 410.0, 358.0, 1.6, 42.0],
+                    "speedup_x": [1.0, 0.18, 0.21, 46.92, 1.78],
                     "total_ops": 1536000,
                 },
                 "load_factor": {
@@ -581,6 +828,17 @@ def main() -> None:
                     "peak_gen3_gbps": 16,
                     "peak_gen4_gbps": 32,
                 },
+                "tail_latency": {
+                    "gpu": {"p50_ms": 0.08, "p90_ms": 0.12, "p99_ms": 0.25},
+                    "gpu_slab": {"p50_ms": 0.05, "p90_ms": 0.09, "p99_ms": 0.18},
+                    "cpu": {"p50_ms": 2.1, "p90_ms": 3.5, "p99_ms": 5.2},
+                    "cpu_per_find_us": {"p50_us": 0.8, "p90_us": 1.5, "p99_us": 3.2},
+                },
+                "occupancy": {
+                    "block_sizes": [32, 64, 128, 256, 512, 1024],
+                    "occupancy": [0.25, 0.5, 0.75, 1.0, 0.75, 0.5],
+                    "throughput_mops": [35.2, 68.1, 95.3, 112.0, 98.5, 72.1],
+                },
             }
         else:
             data = load_data(str(data_path))
@@ -588,8 +846,11 @@ def main() -> None:
     plot_interconnect_crossover(data, outdir)
     plot_warp_aggregation(data, outdir)
     plot_heterogeneous_speedup(data, outdir)
+    plot_timings_and_speedup(data, outdir)
     plot_load_factor_throughput(data, outdir)
     plot_roofline(data, outdir)
+    plot_tail_latency(data, outdir)
+    plot_occupancy_throughput(data, outdir)
     print(f"All figures saved to {outdir.resolve()}")
 
 

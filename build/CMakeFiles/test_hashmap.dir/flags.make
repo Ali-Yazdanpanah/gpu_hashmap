@@ -6,5 +6,5 @@ CUDA_DEFINES =
 
 CUDA_INCLUDES = -I"/mnt/c/Users/Ali/Desktop/Apply/KTH/HPC/HPC projects/gpu_hashmap/include"
 
-CUDA_FLAGS = -O3 -DNDEBUG --generate-code=arch=compute_80,code=[compute_80,sm_80]
+CUDA_FLAGS = -O3 -DNDEBUG --generate-code=arch=compute_86,code=[compute_86,sm_86]
 

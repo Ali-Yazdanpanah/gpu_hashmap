@@ -247,6 +247,32 @@ benchmark_vs_cpu/fast:
 .PHONY : benchmark_vs_cpu/fast
 
 #=============================================================================
+# Target rules for targets named benchmark_tail_latency
+
+# Build rule for target.
+benchmark_tail_latency: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 benchmark_tail_latency
+.PHONY : benchmark_tail_latency
+
+# fast build rule for target.
+benchmark_tail_latency/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/build
+.PHONY : benchmark_tail_latency/fast
+
+#=============================================================================
+# Target rules for targets named benchmark_occupancy
+
+# Build rule for target.
+benchmark_occupancy: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 benchmark_occupancy
+.PHONY : benchmark_occupancy
+
+# fast build rule for target.
+benchmark_occupancy/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_occupancy.dir/build.make CMakeFiles/benchmark_occupancy.dir/build
+.PHONY : benchmark_occupancy/fast
+
+#=============================================================================
 # Target rules for targets named performance_validation_suite
 
 # Build rule for target.
@@ -547,6 +573,30 @@ tests/benchmark_hybrid.cu.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_hybrid.dir/build.make CMakeFiles/benchmark_hybrid.dir/tests/benchmark_hybrid.cu.s
 .PHONY : tests/benchmark_hybrid.cu.s
 
+tests/benchmark_occupancy.o: tests/benchmark_occupancy.cu.o
+.PHONY : tests/benchmark_occupancy.o
+
+# target to build an object file
+tests/benchmark_occupancy.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_occupancy.dir/build.make CMakeFiles/benchmark_occupancy.dir/tests/benchmark_occupancy.cu.o
+.PHONY : tests/benchmark_occupancy.cu.o
+
+tests/benchmark_occupancy.i: tests/benchmark_occupancy.cu.i
+.PHONY : tests/benchmark_occupancy.i
+
+# target to preprocess a source file
+tests/benchmark_occupancy.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_occupancy.dir/build.make CMakeFiles/benchmark_occupancy.dir/tests/benchmark_occupancy.cu.i
+.PHONY : tests/benchmark_occupancy.cu.i
+
+tests/benchmark_occupancy.s: tests/benchmark_occupancy.cu.s
+.PHONY : tests/benchmark_occupancy.s
+
+# target to generate assembly for a file
+tests/benchmark_occupancy.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_occupancy.dir/build.make CMakeFiles/benchmark_occupancy.dir/tests/benchmark_occupancy.cu.s
+.PHONY : tests/benchmark_occupancy.cu.s
+
 tests/benchmark_performance.o: tests/benchmark_performance.cu.o
 .PHONY : tests/benchmark_performance.o
 
@@ -570,6 +620,54 @@ tests/benchmark_performance.s: tests/benchmark_performance.cu.s
 tests/benchmark_performance.cu.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_performance.dir/build.make CMakeFiles/benchmark_performance.dir/tests/benchmark_performance.cu.s
 .PHONY : tests/benchmark_performance.cu.s
+
+tests/benchmark_tail_latency.o: tests/benchmark_tail_latency.cu.o
+.PHONY : tests/benchmark_tail_latency.o
+
+# target to build an object file
+tests/benchmark_tail_latency.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/tests/benchmark_tail_latency.cu.o
+.PHONY : tests/benchmark_tail_latency.cu.o
+
+tests/benchmark_tail_latency.i: tests/benchmark_tail_latency.cu.i
+.PHONY : tests/benchmark_tail_latency.i
+
+# target to preprocess a source file
+tests/benchmark_tail_latency.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/tests/benchmark_tail_latency.cu.i
+.PHONY : tests/benchmark_tail_latency.cu.i
+
+tests/benchmark_tail_latency.s: tests/benchmark_tail_latency.cu.s
+.PHONY : tests/benchmark_tail_latency.s
+
+# target to generate assembly for a file
+tests/benchmark_tail_latency.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/tests/benchmark_tail_latency.cu.s
+.PHONY : tests/benchmark_tail_latency.cu.s
+
+tests/benchmark_tail_latency_impl.o: tests/benchmark_tail_latency_impl.cpp.o
+.PHONY : tests/benchmark_tail_latency_impl.o
+
+# target to build an object file
+tests/benchmark_tail_latency_impl.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/tests/benchmark_tail_latency_impl.cpp.o
+.PHONY : tests/benchmark_tail_latency_impl.cpp.o
+
+tests/benchmark_tail_latency_impl.i: tests/benchmark_tail_latency_impl.cpp.i
+.PHONY : tests/benchmark_tail_latency_impl.i
+
+# target to preprocess a source file
+tests/benchmark_tail_latency_impl.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/tests/benchmark_tail_latency_impl.cpp.i
+.PHONY : tests/benchmark_tail_latency_impl.cpp.i
+
+tests/benchmark_tail_latency_impl.s: tests/benchmark_tail_latency_impl.cpp.s
+.PHONY : tests/benchmark_tail_latency_impl.s
+
+# target to generate assembly for a file
+tests/benchmark_tail_latency_impl.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/benchmark_tail_latency.dir/build.make CMakeFiles/benchmark_tail_latency.dir/tests/benchmark_tail_latency_impl.cpp.s
+.PHONY : tests/benchmark_tail_latency_impl.cpp.s
 
 tests/benchmark_vs_cpu.o: tests/benchmark_vs_cpu.cu.o
 .PHONY : tests/benchmark_vs_cpu.o
@@ -701,7 +799,9 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... benchmark_heuristic"
 	@echo "... benchmark_hybrid"
+	@echo "... benchmark_occupancy"
 	@echo "... benchmark_performance"
+	@echo "... benchmark_tail_latency"
 	@echo "... benchmark_vs_cpu"
 	@echo "... benchmark_zerocopy"
 	@echo "... gpu_hashmap"
@@ -746,9 +846,18 @@ help:
 	@echo "... tests/benchmark_hybrid.o"
 	@echo "... tests/benchmark_hybrid.i"
 	@echo "... tests/benchmark_hybrid.s"
+	@echo "... tests/benchmark_occupancy.o"
+	@echo "... tests/benchmark_occupancy.i"
+	@echo "... tests/benchmark_occupancy.s"
 	@echo "... tests/benchmark_performance.o"
 	@echo "... tests/benchmark_performance.i"
 	@echo "... tests/benchmark_performance.s"
+	@echo "... tests/benchmark_tail_latency.o"
+	@echo "... tests/benchmark_tail_latency.i"
+	@echo "... tests/benchmark_tail_latency.s"
+	@echo "... tests/benchmark_tail_latency_impl.o"
+	@echo "... tests/benchmark_tail_latency_impl.i"
+	@echo "... tests/benchmark_tail_latency_impl.s"
 	@echo "... tests/benchmark_vs_cpu.o"
 	@echo "... tests/benchmark_vs_cpu.i"
 	@echo "... tests/benchmark_vs_cpu.s"

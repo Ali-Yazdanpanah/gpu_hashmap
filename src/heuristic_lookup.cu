@@ -1,6 +1,20 @@
 /**
  * @file heuristic_lookup.cu
  * @brief Heuristic warm-up (measure PCIe/copy cost) and lookup batch dispatcher.
+ *
+ * Sparsity-Driven Crossover (mathematical validation):
+ * ---------------------------------
+ * The crossover between Standard and Zero-Copy path occurs when:
+ *
+ *   Time(Full Table Copy) > Time(Sparse PCIe Stalls)
+ *
+ * - Standard path: migrates the entire table to VRAM (H2D), then copies keys H2D,
+ *   runs kernel, copies results D2H. For a massive table (e.g. 2GB) and sparse
+ *   lookups (e.g. N = 10,000), the one-time "Copy Tax" of the table dominates.
+ * - Zero-Copy path: table remains in pinned host memory; the GPU fetches only
+ *   the buckets needed for those 10,000 keys over PCIe. No full table migration.
+ * So for sparse workloads on a massive table, Zero-Copy is optimal despite
+ * slower per-access PCIe latency, because we avoid the full table migration cost.
  */
 
 #include "gpu_hashmap/heuristic_lookup.h"
@@ -128,9 +142,14 @@ void hash_map_lookup_batch_heuristic(HashTable* table,
                                      HeuristicState* state,
                                      cudaStream_t stream) {
   LookupPath path = heuristic_choose_path(n, state);
+  bool sparsity_driven = (state->table_size_bytes >= kSparsityTableSizeThreshold &&
+                           n <= kSparsityLookupCap);
   if (path == LookupPath::ZeroCopy) {
     hash_map_lookup_batch_zero_copy(table, h_keys, h_results, n, stream);
-    std::printf("Heuristic chose Zero-Copy for %zu lookups to minimize end-to-end latency.\n", n);
+    if (sparsity_driven)
+      std::printf("Sparsity detected: Zero-Copy chosen to bypass 2GB table migration tax.\n");
+    else
+      std::printf("Heuristic chose Zero-Copy for %zu lookups to minimize end-to-end latency.\n", n);
   } else {
     hash_map_lookup_batch_standard_copy(table, h_keys, h_results, n, stream);
     std::printf("Heuristic chose Standard Copy for %zu lookups to minimize end-to-end latency.\n", n);

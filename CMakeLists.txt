@@ -96,6 +96,22 @@ add_executable(benchmark_vs_cpu tests/benchmark_vs_cpu.cu)
 target_include_directories(benchmark_vs_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(benchmark_vs_cpu PRIVATE gpu_hashmap gpu_hashmap_slab)
 
+# P99 tail latency: percentile breakdown (P50, P90, P99) and histogram of batch latencies
+add_executable(benchmark_tail_latency
+  tests/benchmark_tail_latency.cu
+  tests/benchmark_tail_latency_impl.cpp
+)
+target_include_directories(benchmark_tail_latency PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_link_libraries(benchmark_tail_latency PRIVATE gpu_hashmap gpu_hashmap_slab)
+
+# Occupancy vs throughput: sweep block sizes 32--1024 for chart data
+add_executable(benchmark_occupancy tests/benchmark_occupancy.cu)
+target_include_directories(benchmark_occupancy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(benchmark_occupancy PRIVATE gpu_hashmap)
+
 # -----------------------------------------------------------------------------
 # Performance analysis & validation suite (academic metrics)
 # -----------------------------------------------------------------------------
