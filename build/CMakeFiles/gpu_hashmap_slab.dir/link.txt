@@ -1,2 +1,0 @@
-/usr/bin/ar qc libgpu_hashmap_slab.a CMakeFiles/gpu_hashmap_slab.dir/src/slab_hash.cu.o
-/usr/bin/ranlib libgpu_hashmap_slab.a

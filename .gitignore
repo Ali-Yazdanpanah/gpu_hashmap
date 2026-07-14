@@ -1,0 +1,26 @@
+# Build directory
+build/
+
+# CMake-generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+scripts/Makefile
+
+# Compiled objects and libraries
+*.o
+*.a
+*.so
+
+# Compiled benchmark / test executables
+scripts/benchmark_heuristic
+scripts/benchmark_hybrid
+scripts/benchmark_occupancy
+scripts/benchmark_performance
+scripts/benchmark_tail_latency
+scripts/benchmark_vs_cpu
+scripts/benchmark_zerocopy
+scripts/performance_validation_suite
+scripts/test_hashmap
+scripts/test_slab
