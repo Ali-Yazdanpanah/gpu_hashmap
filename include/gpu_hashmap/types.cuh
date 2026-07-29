@@ -23,6 +23,20 @@ constexpr SlotIndex kInvalidSlot = 0xFFFFFFFFu;
 /** Maximum capacity when using SlotIndex = uint32_t. */
 constexpr size_t kMaxSlots = 0xFFFFFFFFu;
 
+/**
+ * Where a table's bulk storage is allocated.
+ *
+ * This was previously fixed per table type -- the chained table always in mapped host
+ * memory, the slab table always in device memory -- which fused two effects that any
+ * comparison between them then could not separate: whether one scheme is better, and
+ * whether reaching the table over PCIe is worse than reaching it in VRAM. Both tables
+ * now accept a placement so each effect can be measured on its own.
+ */
+enum class TablePlacement {
+  kMappedHost,  ///< cudaHostAlloc(Mapped): host resident, GPU reaches it over PCIe
+  kDevice,      ///< cudaMalloc: device resident, no host-side view
+};
+
 } // namespace gpu_hashmap
 
 #endif // GPU_HASHMAP_TYPES_CUH

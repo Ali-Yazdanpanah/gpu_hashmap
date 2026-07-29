@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #define CUDA_CHECK(call)                                                       \
@@ -97,10 +98,13 @@ int main() {
               num_buckets, n_insert, gpu_hashmap::kHeuristicDefaultCrossoverN);
   std::printf("================================================================================\n\n");
 
-  /* ---------- Warm-up: calibrate crossover from current system ---------- */
-  std::printf("--- Warm-up (measures PCIe/copy cost at 256k lookups) ---\n");
+  /* ---------- Warm-up: calibrate across several batch sizes ---------- */
+  std::printf("--- Warm-up (multi-size calibration; see stderr for per-size ratios) ---\n");
   heuristic_warm_up(&table, &state);
-  std::printf("  After warm-up: crossover_n = %zu\n\n", state.crossover_n);
+  if (state.decided)
+    std::printf("  After warm-up: decided, Zero-Copy when n <= %zu\n\n", state.zerocopy_below_n);
+  else
+    std::printf("  After warm-up: UNDECIDED (no size met the safety margin)\n\n");
 
   /* Sweep: use pinned buffers so Zero-Copy path is true zero-copy (no memcpy at end). */
   const size_t sweep_sizes[] = { 16 * 1024, 32 * 1024, 64 * 1024, 128 * 1024,
@@ -121,11 +125,24 @@ int main() {
   const int kWarmupReps = 2;
   const int kTimedReps = 7;
 
-  std::printf("--- Lookup path sweep (both paths measured at every N) ---\n");
-  std::printf("  %-12s  %-14s  %-14s  %-14s  %s\n",
-              "N", "Standard(ms)", "ZeroCopy(ms)", "Chosen", "ZC/Std");
-  std::printf("  %-12s  %-14s  %-14s  %-14s  %s\n",
-              "---", "---", "---", "---", "---");
+  std::printf("--- Lookup path sweep (both paths measured; heuristic scored against ground truth) ---\n");
+  std::printf("  %-12s  %-14s  %-14s  %-12s  %-12s  %-8s  %s\n",
+              "N", "Standard(ms)", "ZeroCopy(ms)", "Faster", "Chosen", "Correct", "ZC/Std");
+  std::printf("  %-12s  %-14s  %-14s  %-12s  %-12s  %-8s  %s\n",
+              "---", "---", "---", "---", "---", "---", "---");
+
+  int accuracy_correct = 0;
+  int accuracy_total = 0;
+  /* Machine-readable block for scripts/plot_benchmarks.py / check_results.py. */
+  struct AccRow {
+    size_t n;
+    double std_ms, zc_ms;
+    const char* faster;
+    const char* chosen;
+    bool correct;
+  };
+  AccRow acc_rows[16];
+  int acc_nrows = 0;
 
   for (int i = 0; i < num_sizes; ++i) {
     const size_t n = sweep_sizes[i];
@@ -140,9 +157,42 @@ int main() {
     }, kWarmupReps, kTimedReps);
 
     gpu_hashmap::LookupPath path = heuristic_choose_path(n, &state);
-    const char* path_str = (path == gpu_hashmap::LookupPath::ZeroCopy) ? "Zero-Copy" : "Standard";
-    std::printf("  %-12zu  %-14.3f  %-14.3f  %-14s  %.2f\n",
-                n, std_ms, zc_ms, path_str, (std_ms > 0 ? zc_ms / std_ms : 0.0));
+    const char* path_str =
+        (path == gpu_hashmap::LookupPath::ZeroCopy)   ? "Zero-Copy"
+        : (path == gpu_hashmap::LookupPath::Undecided) ? "Undecided"
+                                                       : "Standard";
+    /* Ground truth: which path was faster in this measurement. Ties go to Standard
+     * so a Zero-Copy pick on a tie counts as wrong (conservative). */
+    const char* faster = (zc_ms < std_ms) ? "Zero-Copy" : "Standard";
+    /* Undecided falls through to Standard at execution time, so score it that way. */
+    const char* effective =
+        (path == gpu_hashmap::LookupPath::ZeroCopy) ? "Zero-Copy" : "Standard";
+    const bool correct = (std::strcmp(effective, faster) == 0);
+    ++accuracy_total;
+    if (correct) ++accuracy_correct;
+
+    AccRow& row = acc_rows[acc_nrows++];
+    row.n = n;
+    row.std_ms = std_ms;
+    row.zc_ms = zc_ms;
+    row.faster = faster;
+    row.chosen = path_str;
+    row.correct = correct;
+
+    std::printf("  %-12zu  %-14.3f  %-14.3f  %-12s  %-12s  %-8s  %.2f\n",
+                n, std_ms, zc_ms, faster, path_str, correct ? "yes" : "no",
+                (std_ms > 0 ? zc_ms / std_ms : 0.0));
+  }
+  std::printf("\n");
+  std::printf("HEURISTIC ACCURACY: %d / %d correct (%.0f%%)\n", accuracy_correct, accuracy_total,
+              100.0 * accuracy_correct / (accuracy_total + 1e-9));
+  std::printf("HEURISTIC ACCURACY ROWS\n");
+  std::printf("%-10s %12s %12s %-12s %-12s %s\n", "n", "standard_ms", "zerocopy_ms", "faster",
+              "chosen", "correct");
+  for (int i = 0; i < acc_nrows; ++i) {
+    const AccRow& r = acc_rows[i];
+    std::printf("%-10zu %12.3f %12.3f %-12s %-12s %s\n", r.n, r.std_ms, r.zc_ms, r.faster,
+                r.chosen, r.correct ? "yes" : "no");
   }
   std::printf("\n");
 

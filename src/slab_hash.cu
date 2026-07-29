@@ -147,15 +147,36 @@ __global__ void slab_insert_kernel(SlabHashTableDevice const* table,
 
 } // namespace
 
-void slab_hash_create(SlabHashTable* table, size_t num_buckets, cudaStream_t stream) {
+void slab_hash_create(SlabHashTable* table, size_t num_buckets, cudaStream_t stream,
+                      TablePlacement placement) {
   if (num_buckets == 0 || (num_buckets & (num_buckets - 1)) != 0) {
     std::fprintf(stderr, "slab_hash_create: num_buckets must be power of 2\n");
     std::abort();
   }
   size_t slab_entries = num_buckets * kSlabSize;
-  CUDA_CHECK(cudaMalloc(&table->d_keys, slab_entries * sizeof(KeyType)));
-  CUDA_CHECK(cudaMalloc(&table->d_values, slab_entries * sizeof(ValueType)));
-  CUDA_CHECK(cudaMalloc(&table->d_used_mask, num_buckets * sizeof(unsigned int)));
+  table->placement = placement;
+  if (placement == TablePlacement::kDevice) {
+    CUDA_CHECK(cudaMalloc(&table->d_keys, slab_entries * sizeof(KeyType)));
+    CUDA_CHECK(cudaMalloc(&table->d_values, slab_entries * sizeof(ValueType)));
+    CUDA_CHECK(cudaMalloc(&table->d_used_mask, num_buckets * sizeof(unsigned int)));
+  } else {
+    /* Mapped host storage: every used_mask atomicCAS becomes a PCIe round trip, which
+     * is exactly the cost being isolated. h_* is not retained because nothing walks the
+     * slab table from the host; the device pointers are all that is needed. */
+    const unsigned int flags = cudaHostAllocMapped | cudaHostAllocPortable;
+    void* h_keys = nullptr;
+    void* h_values = nullptr;
+    void* h_used = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&h_keys, slab_entries * sizeof(KeyType), flags));
+    CUDA_CHECK(cudaHostAlloc(&h_values, slab_entries * sizeof(ValueType), flags));
+    CUDA_CHECK(cudaHostAlloc(&h_used, num_buckets * sizeof(unsigned int), flags));
+    CUDA_CHECK(cudaHostGetDevicePointer((void**)&table->d_keys, h_keys, 0));
+    CUDA_CHECK(cudaHostGetDevicePointer((void**)&table->d_values, h_values, 0));
+    CUDA_CHECK(cudaHostGetDevicePointer((void**)&table->d_used_mask, h_used, 0));
+    table->h_keys = h_keys;
+    table->h_values = h_values;
+    table->h_used_mask = h_used;
+  }
   CUDA_CHECK(cudaMalloc(&table->d_device_table, sizeof(SlabHashTableDevice)));
   CUDA_CHECK(cudaMalloc(&table->d_insert_failures, sizeof(unsigned long long)));
   CUDA_CHECK(cudaMemset(table->d_insert_failures, 0, sizeof(unsigned long long)));
@@ -182,9 +203,19 @@ void slab_hash_create(SlabHashTable* table, size_t num_buckets, cudaStream_t str
 void slab_hash_destroy(SlabHashTable* table) {
   if (!table) return;
   if (table->d_device_table) CUDA_CHECK(cudaFree(table->d_device_table));
-  if (table->d_used_mask) CUDA_CHECK(cudaFree(table->d_used_mask));
-  if (table->d_values) CUDA_CHECK(cudaFree(table->d_values));
-  if (table->d_keys) CUDA_CHECK(cudaFree(table->d_keys));
+  if (table->placement == TablePlacement::kDevice) {
+    if (table->d_used_mask) CUDA_CHECK(cudaFree(table->d_used_mask));
+    if (table->d_values) CUDA_CHECK(cudaFree(table->d_values));
+    if (table->d_keys) CUDA_CHECK(cudaFree(table->d_keys));
+  } else {
+    /* d_* are mapped views; the allocations belong to the h_* pointers. */
+    if (table->h_used_mask) CUDA_CHECK(cudaFreeHost(table->h_used_mask));
+    if (table->h_values) CUDA_CHECK(cudaFreeHost(table->h_values));
+    if (table->h_keys) CUDA_CHECK(cudaFreeHost(table->h_keys));
+  }
+  table->h_keys = nullptr;
+  table->h_values = nullptr;
+  table->h_used_mask = nullptr;
   if (table->d_insert_failures) CUDA_CHECK(cudaFree(table->d_insert_failures));
   table->d_device_table = nullptr;
   table->d_used_mask = nullptr;

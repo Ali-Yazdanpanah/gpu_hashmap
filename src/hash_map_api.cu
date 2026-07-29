@@ -34,7 +34,7 @@ __global__ void init_bucket_heads_kernel(unsigned long long* heads, size_t n) {
 } // namespace
 
 void hash_map_create(HashTable* table, size_t num_buckets, size_t capacity,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, TablePlacement placement) {
   if (num_buckets == 0 || (num_buckets & (num_buckets - 1)) != 0) {
     std::fprintf(stderr, "hash_map_create: num_buckets must be power of 2\n");
     std::abort();
@@ -52,13 +52,23 @@ void hash_map_create(HashTable* table, size_t num_buckets, size_t capacity,
   table->d_scratch_keys = nullptr;
   table->d_scratch_values = nullptr;
   table->scratch_capacity = 0;
+  table->placement = placement;
 
-  /* Zero-copy: mapped host memory so GPU accesses over PCIe; portable for multi-GPU. */
-  const unsigned int flags = cudaHostAllocMapped | cudaHostAllocPortable;
-  CUDA_CHECK(cudaHostAlloc(&table->h_bucket_heads, num_buckets * sizeof(unsigned long long), flags));
-  CUDA_CHECK(cudaHostAlloc(&table->h_nodes, capacity * sizeof(Node), flags));
-  CUDA_CHECK(cudaHostGetDevicePointer(&table->d_bucket_heads, table->h_bucket_heads, 0));
-  CUDA_CHECK(cudaHostGetDevicePointer(&table->d_nodes, table->h_nodes, 0));
+  if (placement == TablePlacement::kMappedHost) {
+    /* Mapped host memory: the GPU reaches bucket_heads and nodes over PCIe, and the
+     * host keeps a view of them for upload_from_host and full-table migration. */
+    const unsigned int flags = cudaHostAllocMapped | cudaHostAllocPortable;
+    CUDA_CHECK(cudaHostAlloc(&table->h_bucket_heads, num_buckets * sizeof(unsigned long long), flags));
+    CUDA_CHECK(cudaHostAlloc(&table->h_nodes, capacity * sizeof(Node), flags));
+    CUDA_CHECK(cudaHostGetDevicePointer(&table->d_bucket_heads, table->h_bucket_heads, 0));
+    CUDA_CHECK(cudaHostGetDevicePointer(&table->d_nodes, table->h_nodes, 0));
+  } else {
+    /* Device resident: no host-side view, so atomics stay on-device. */
+    table->h_bucket_heads = nullptr;
+    table->h_nodes = nullptr;
+    CUDA_CHECK(cudaMalloc(&table->d_bucket_heads, num_buckets * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&table->d_nodes, capacity * sizeof(Node)));
+  }
 
   table->device.bucket_heads = static_cast<unsigned long long*>(table->d_bucket_heads);
   table->device.nodes = static_cast<Node*>(table->d_nodes);
@@ -91,10 +101,22 @@ void hash_map_destroy(HashTable* table) {
     CUDA_CHECK(cudaFree(table->d_device_table));
   if (table->d_slab_device)
     CUDA_CHECK(cudaFree(table->d_slab_device));
-  if (table->h_bucket_heads)
-    CUDA_CHECK(cudaFreeHost(table->h_bucket_heads));
-  if (table->h_nodes)
-    CUDA_CHECK(cudaFreeHost(table->h_nodes));
+  if (table->placement == TablePlacement::kMappedHost) {
+    if (table->h_bucket_heads)
+      CUDA_CHECK(cudaFreeHost(table->h_bucket_heads));
+    if (table->h_nodes)
+      CUDA_CHECK(cudaFreeHost(table->h_nodes));
+  } else {
+    /* Device placement: d_* came from cudaMalloc, not from a mapped host allocation. */
+    if (table->d_bucket_heads)
+      CUDA_CHECK(cudaFree(table->d_bucket_heads));
+    if (table->d_nodes)
+      CUDA_CHECK(cudaFree(table->d_nodes));
+  }
+  table->h_bucket_heads = nullptr;
+  table->h_nodes = nullptr;
+  table->d_bucket_heads = nullptr;
+  table->d_nodes = nullptr;
   if (table->d_scratch_keys)
     CUDA_CHECK(cudaFree(table->d_scratch_keys));
   if (table->d_scratch_values)
@@ -170,10 +192,21 @@ void hash_map_upload_from_host(HashTable* table, KeyType const* h_keys,
     h_nodes[i].next = static_cast<SlotIndex>(h_bucket_heads[b]);
     h_bucket_heads[b] = slot;
   }
-  /* Zero-copy: write directly to mapped host memory; GPU reads over PCIe. No cudaMemcpy. */
-  std::memcpy(table->h_bucket_heads, h_bucket_heads.data(),
-              num_buckets * sizeof(unsigned long long));
-  std::memcpy(table->h_nodes, h_nodes.data(), n * sizeof(Node));
+  if (table->placement == TablePlacement::kMappedHost) {
+    /* Write straight into mapped host memory; the GPU reads it over PCIe, no copy. */
+    std::memcpy(table->h_bucket_heads, h_bucket_heads.data(),
+                num_buckets * sizeof(unsigned long long));
+    std::memcpy(table->h_nodes, h_nodes.data(), n * sizeof(Node));
+  } else {
+    /* Device placement has no host view, so the built table has to be copied in.
+     * That copy is the "migration tax" the zero-copy path exists to avoid. */
+    CUDA_CHECK(cudaMemcpyAsync(table->d_bucket_heads, h_bucket_heads.data(),
+                               num_buckets * sizeof(unsigned long long),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(table->d_nodes, h_nodes.data(), n * sizeof(Node),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  }
 }
 
 } // namespace gpu_hashmap

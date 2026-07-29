@@ -34,7 +34,8 @@ add_library(gpu_hashmap STATIC
   src/lookup_api.cu
   src/heuristic_lookup.cu
 )
-# Slab-based hash table (bucketed linear probing, one atomic per warp)
+# Slab-based hash table: fixed 8-slot buckets, one atomic per warp. Not probing and
+# not chaining -- a bucket that overflows drops the key (see hash_slab.cuh).
 add_library(gpu_hashmap_slab STATIC
   src/slab_hash.cu
 )
@@ -83,10 +84,43 @@ add_executable(test_slab tests/test_slab.cu)
 target_include_directories(test_slab PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_slab PRIVATE gpu_hashmap_slab)
 
+# Pins the drop-on-overflow count, which test_slab cannot cover because it requires
+# dropped == 0 and therefore only ever runs below capacity.
+add_executable(test_slab_overflow tests/test_slab_overflow.cu)
+target_include_directories(test_slab_overflow PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_slab_overflow PRIVATE gpu_hashmap_slab)
+
 # Correctness tests run under CTest (`ctest --output-on-failure`). The benchmarks
 # are deliberately not registered: they are timing runs, not pass/fail checks.
 add_test(NAME test_hashmap COMMAND test_hashmap)
 add_test(NAME test_slab COMMAND test_slab)
+add_test(NAME test_slab_overflow COMMAND test_slab_overflow)
+
+# -----------------------------------------------------------------------------
+# Aggregate gate: `cmake --build build --target check`
+# -----------------------------------------------------------------------------
+# Runs correctness first, then verifies that every measured number in README.md
+# still agrees with scripts/benchmark_data.json. Without the second step the
+# README's honesty depends on remembering to update it by hand.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_custom_target(check
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_results.py
+            --data ${CMAKE_CURRENT_SOURCE_DIR}/scripts/benchmark_data.json
+            --readme ${CMAKE_CURRENT_SOURCE_DIR}/README.md
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    COMMENT "Gate: correctness tests, then README/data agreement"
+    VERBATIM
+  )
+  add_dependencies(check test_hashmap test_slab test_slab_overflow)
+else()
+  add_custom_target(check
+    COMMAND ${CMAKE_COMMAND} -E false
+    COMMENT "Gate needs a Python 3 interpreter for scripts/check_results.py"
+  )
+endif()
 
 # Zero-copy (mapped memory) lookup benchmark: kernel-only vs copy+kernel
 add_executable(benchmark_zerocopy tests/benchmark_zerocopy.cu)
@@ -102,6 +136,11 @@ target_link_libraries(benchmark_heuristic PRIVATE gpu_hashmap)
 add_executable(benchmark_vs_cpu tests/benchmark_vs_cpu.cu)
 target_include_directories(benchmark_vs_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(benchmark_vs_cpu PRIVATE gpu_hashmap gpu_hashmap_slab)
+
+# Placement x scheme: separates PCIe residency from the choice of hashing scheme
+add_executable(benchmark_placement tests/benchmark_placement.cu)
+target_include_directories(benchmark_placement PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(benchmark_placement PRIVATE gpu_hashmap gpu_hashmap_slab)
 
 # P99 tail latency: percentile breakdown (P50, P90, P99) and histogram of batch latencies
 add_executable(benchmark_tail_latency

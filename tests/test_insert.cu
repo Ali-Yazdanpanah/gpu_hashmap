@@ -68,6 +68,12 @@ int main() {
 
   gpu_hashmap::hash_map_insert_batch(&table, d_keys, d_values, n);
   CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaGetLastError());
+
+  /* The chained insert gives up after 4096 CAS attempts and after slab exhaustion,
+   * recording a counter instead of failing loudly. Without asserting it here, retry
+   * exhaustion would pass this test silently while keys went missing. */
+  const unsigned long long insert_failures = gpu_hashmap::hash_map_insert_failure_count(&table);
 
   std::vector<gpu_hashmap::KeyType> h_lookup_keys = { 0, 2, 100, 9999*2, 99999 };
   size_t n_lookup = h_lookup_keys.size();
@@ -84,6 +90,11 @@ int main() {
   CUDA_CHECK(cudaMemcpy(h_out.data(), d_lookup_out, n_lookup * sizeof(gpu_hashmap::ValueType), cudaMemcpyDeviceToHost));
 
   bool ok = true;
+  if (insert_failures != 0) {
+    std::fprintf(stderr, "insert failures: %llu of %zu inserts were not stored\n",
+                 insert_failures, n);
+    ok = false;
+  }
   for (size_t i = 0; i < n_lookup; ++i) {
     gpu_hashmap::KeyType k = h_lookup_keys[i];
     gpu_hashmap::ValueType expected = (k % 2 == 0 && k/2 < n) ? (k/2 + 1000) : 0xFFFFFFFFFFFFFFFFull;

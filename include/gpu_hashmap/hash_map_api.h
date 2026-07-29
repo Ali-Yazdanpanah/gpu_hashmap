@@ -13,9 +13,17 @@
 
 namespace gpu_hashmap {
 
-/** Create hash table: num_buckets (power of 2), capacity = max entries (slab size). */
+/**
+ * Create hash table: num_buckets (power of 2), capacity = max entries (slab size).
+ *
+ * `placement` selects where bucket_heads and nodes are allocated. kMappedHost is the
+ * default because the zero-copy lookup path and hash_map_upload_from_host both need a
+ * host-side view of the table. Pass kDevice to measure the chained scheme without the
+ * PCIe residency cost folded in.
+ */
 void hash_map_create(HashTable* table, size_t num_buckets, size_t capacity,
-                     cudaStream_t stream = nullptr);
+                     cudaStream_t stream = nullptr,
+                     TablePlacement placement = TablePlacement::kMappedHost);
 
 void hash_map_destroy(HashTable* table);
 

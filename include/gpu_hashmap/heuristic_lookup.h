@@ -1,9 +1,16 @@
 /**
  * @file heuristic_lookup.h
- * @brief Heuristic optimizer: choose Standard Copy vs Zero-Copy lookup by N.
+ * @brief Heuristic: choose Standard Copy vs Zero-Copy lookup by measured batch cost.
  *
- * Uses benchmark data (1.29 ms savings at 256k lookups) for default crossover.
- * Warm-up measures current PCIe/copy cost and adjusts the crossover dynamically.
+ * Measured on this PCIe Gen3 laptop: zero-copy is fastest at *small* batches and the
+ * advantage shrinks as N grows. The old rule ("prefer Zero-Copy when n >= crossover_n")
+ * had the polarity wrong and almost never fired. The rule here is:
+ *
+ *   use Zero-Copy when n_lookups <= zerocopy_below_n
+ *
+ * calibrated across several batch sizes with a median of k reps and a safety margin.
+ * If no size meets the margin, the state is explicitly Undecided rather than silently
+ * defaulting to SIZE_MAX.
  */
 
 #ifndef GPU_HASHMAP_HEURISTIC_LOOKUP_H
@@ -16,78 +23,73 @@
 
 namespace gpu_hashmap {
 
-enum class LookupPath { StandardCopy, ZeroCopy };
+enum class LookupPath { StandardCopy, ZeroCopy, Undecided };
 
 /**
- * State for the heuristic: crossover threshold, out-of-core fallback, sparsity, and warm-up flag.
+ * State for the heuristic: batch-size rule, out-of-core fallback, sparsity, warm-up.
+ *
+ * `zerocopy_below_n`: use Zero-Copy when n_lookups <= this (inclusive). 0 means the
+ * batch-size rule never picks Zero-Copy (still subject to sparsity / out-of-core).
+ * `decided`: false when calibration found no size meeting the margin.
  */
 struct HeuristicState {
-  size_t crossover_n;           ///< use Zero-Copy when n_lookups >= this (set by warm-up with safety margin)
-  size_t max_lookups_fit_vram;  ///< if n > this, force Zero-Copy (out-of-core fallback); set in warm-up
-  size_t table_size_bytes;      ///< if set and large, sparsity mode: prefer Zero-Copy to avoid table migration tax
-  bool warmed_up;               ///< true after heuristic_warm_up()
+  size_t zerocopy_below_n;      ///< use Zero-Copy when n <= this; 0 if none
+  size_t crossover_n;           ///< deprecated alias kept for older call sites (= zerocopy_below_n or SIZE_MAX)
+  size_t max_lookups_fit_vram;  ///< if n > this, force Zero-Copy (out-of-core)
+  size_t table_size_bytes;      ///< sparsity: prefer Zero-Copy to avoid table migration tax
+  bool warmed_up;
+  bool decided;                 ///< false => batch-size rule is Undecided
 };
 
-/** Table size above which we consider "massive table" for sparsity-driven crossover (e.g. 2GB). */
+/** Table size above which we consider "massive table" for sparsity-driven crossover. */
 constexpr size_t kSparsityTableSizeThreshold = 1500ULL * 1024 * 1024;
-/** Lookup count below which we consider "sparse" when table is massive (e.g. N=10,000). */
+/** Lookup count below which we consider "sparse" when table is massive. */
 constexpr size_t kSparsityLookupCap = 100 * 1024;
 
-/** Default crossover from benchmark: 1.29 ms savings at 256k lookups. */
+/** Legacy default; warm-up overwrites it. Kept so un-warmed state is defined. */
 constexpr size_t kHeuristicDefaultCrossoverN = 256 * 1024;
 
-/**
- * Initialize state with default crossover (256k) and no VRAM limit until warm-up.
- */
 inline void heuristic_init(HeuristicState* state) {
+  state->zerocopy_below_n = 0;
   state->crossover_n = kHeuristicDefaultCrossoverN;
-  state->max_lookups_fit_vram = SIZE_MAX;  /* set by warm_up from cudaMemGetInfo */
-  state->table_size_bytes = 0;             /* set by caller for sparsity-driven crossover */
+  state->max_lookups_fit_vram = SIZE_MAX;
+  state->table_size_bytes = 0;
   state->warmed_up = false;
+  state->decided = false;
 }
 
-/**
- * Set table size (bytes) for sparsity-driven crossover. When table is massive and
- * n_lookups is small, the heuristic will prefer Zero-Copy to avoid the full table
- * migration tax (Standard path would pay Time(Full Table Copy) before sparse lookups).
- */
 inline void heuristic_set_table_size(HeuristicState* state, size_t table_bytes) {
   state->table_size_bytes = table_bytes;
 }
 
 /**
- * Warm-up: measure Standard Copy and Zero-Copy at 256k lookups, then set
- * crossover_n from current PCIe/copy cost. Probe keys are taken from the table so
- * calibration reflects successful finds, and each path is warmed before timing and
- * measured three times; the median is used.
- *
- * Note: on PCIe Gen3 hardware the measured ratio at this probe size sits near 0.9,
- * above the 0.8 margin, so crossover_n commonly ends up SIZE_MAX (always Standard)
- * even though Zero-Copy is faster at smaller batches. See README section 6.2.
+ * Warm-up: measure Standard and Zero-Copy at several batch sizes (median of 3 after a
+ * warm pass each), using keys drawn from the table. Sets zerocopy_below_n to the
+ * largest N where Zero-Copy is at least (1 - margin) faster; if no such N, decided=false.
  */
 void heuristic_warm_up(HashTable* table, HeuristicState* state,
                        cudaStream_t stream = nullptr);
 
 /**
- * Choose path for n_lookups: sparsity (massive table + sparse lookups) and out-of-core
- * force Zero-Copy; else use crossover_n. Sparsity: when table_size_bytes is large and
- * n_lookups is small, Zero-Copy avoids Time(Full Table Copy) > Time(Sparse PCIe Stalls).
+ * Choose path for n_lookups. Priority: out-of-core -> sparsity -> batch-size rule.
+ * When the batch-size rule is undecided, returns Undecided (caller should treat as
+ * StandardCopy for execution and report the uncertainty).
  */
 inline LookupPath heuristic_choose_path(size_t n_lookups, HeuristicState const* state) {
   if (n_lookups > state->max_lookups_fit_vram)
-    return LookupPath::ZeroCopy;  /* out-of-core fallback: batch does not fit in VRAM */
-  /* Sparsity-driven: massive table + sparse lookups => avoid full table migration tax */
+    return LookupPath::ZeroCopy;
   if (state->table_size_bytes >= kSparsityTableSizeThreshold &&
       n_lookups <= kSparsityLookupCap)
     return LookupPath::ZeroCopy;
-  return (n_lookups >= state->crossover_n) ? LookupPath::ZeroCopy : LookupPath::StandardCopy;
+  if (!state->decided)
+    return LookupPath::Undecided;
+  return (n_lookups <= state->zerocopy_below_n) ? LookupPath::ZeroCopy
+                                                : LookupPath::StandardCopy;
 }
 
 /**
- * Run lookup batch using the heuristic (Standard or Zero-Copy) and log the choice.
- * For Zero-Copy path: h_keys and h_results must be pinned (cudaHostAlloc Mapped);
- * results are written in place (true zero-copy, no memcpy). For Standard path,
- * any host pointers are valid (explicit H2D/D2H).
+ * Run lookup using the heuristic. Undecided falls through to Standard Copy and logs so.
+ * For Zero-Copy, h_keys/h_results must be pinned (cudaHostAlloc Mapped).
  */
 void hash_map_lookup_batch_heuristic(HashTable* table,
                                      KeyType* h_keys,

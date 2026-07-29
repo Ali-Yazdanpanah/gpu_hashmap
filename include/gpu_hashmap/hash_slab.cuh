@@ -1,7 +1,9 @@
 /**
  * @file hash_slab.cuh
- * @brief Bucketed linear probing: each bucket is a slab of K key-value pairs (one cache line).
- * Warp cooperatively searches for empty slots and performs one atomic per warp to claim them.
+ * @brief Bucketed table with drop-on-overflow: each bucket is a slab of K key-value pairs.
+ * A warp cooperatively searches for empty slots and performs one atomic per warp to claim
+ * them. This is neither open addressing nor chaining: a key whose bucket is full is not
+ * probed elsewhere and gets no overflow node, it is discarded (see slab_hash_insert_failure_count).
  */
 
 #ifndef GPU_HASHMAP_HASH_SLAB_CUH
@@ -42,9 +44,19 @@ struct SlabHashTable {
   unsigned long long* d_insert_failures;
   SlabHashTableDevice* d_device_table;
   size_t num_buckets;
+  /* Host side of the mapped allocations; null under kDevice placement. Retained only
+   * so destroy can release them with cudaFreeHost. */
+  void* h_keys;
+  void* h_values;
+  void* h_used_mask;
+  /** Where keys/values/used_mask live. Device by default; kMappedHost exists so the
+   *  slab scheme can be measured under the same PCIe residency as the chained table,
+   *  which is what separates "better scheme" from "better placement". */
+  TablePlacement placement;
 };
 
-void slab_hash_create(SlabHashTable* table, size_t num_buckets, cudaStream_t stream = nullptr);
+void slab_hash_create(SlabHashTable* table, size_t num_buckets, cudaStream_t stream = nullptr,
+                      TablePlacement placement = TablePlacement::kDevice);
 void slab_hash_destroy(SlabHashTable* table);
 
 /**

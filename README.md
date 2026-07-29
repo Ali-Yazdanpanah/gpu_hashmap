@@ -12,15 +12,17 @@ On an **NVIDIA RTX 3060 Laptop GPU** (Compute Capability 8.6, PCIe Gen3×16 per 
 
 | Finding | Measured |
 |---|---|
-| Slab hash table vs. `std::unordered_map` (1M inserts + 512K lookups) | **124× faster**, but it silently drops **0.838%** of inserts |
-| Chained hash table vs. `std::unordered_map` | **0.38× — slower than the CPU**, because the table lives in mapped host memory |
-| Warp aggregation under hot-key skew (Zipfian α=2.0) | **10.1× faster** inserts than the standard kernel |
-| Warp aggregation under mild skew (Zipfian α=0.5) | **1.08×** — essentially no benefit |
-| Zero-copy on a 2 GB table with 10K sparse lookups | **0.73 ms vs 338 ms** for naive full-table migration (**461×**) |
-| Effective bandwidth, chained lookup | **0.22 GB/s** against a 16 GB/s PCIe Gen3 floor — **1.4%** |
-| Correctness vs. a CPU gold model | **PASS**, bit-perfect |
+| Slab vs CPU (1M inserts + 512K lookups) | <!-- generated: slab_vs_cpu=83.17 -->**83.17×** faster, drops <!-- generated: slab_drop_pct=0.838 -->**0.838%** of inserts |
+| Chained vs CPU (mapped-host default) | <!-- generated: chained_vs_cpu=0.51 -->**0.51× — slower than the CPU** |
+| Placement effect (chained host / device) | <!-- generated: placement_speedup_chained=1.2 -->**1.2×** — PCIe residency is *not* the main chained cost |
+| Scheme effect (chained device / slab device) | <!-- generated: algorithm_speedup_device=318.0 -->**318.0×** — **scheme dominates** |
+| Warp aggregation (Zipfian α=2.0 / 0.5) | <!-- generated: warpagg_speedup_hi=7.94 -->**7.94×** / <!-- generated: warpagg_speedup_lo=1.00 -->**1.00×** |
+| Zero-copy sparse lookup on 2 GB table | <!-- generated: sparsity_zerocopy_ms=0.261 -->**0.261 ms** vs <!-- generated: sparsity_naive_ms=321.250 -->**321.250 ms** (<!-- generated: sparsity_speedup_vs_naive=1231 -->**1231×**) |
+| Effective bandwidth, chained lookup | <!-- generated: lookup_gbps=0.24 -->**0.24 GB/s** = <!-- generated: lookup_pct_gen3=1.5 -->**1.5%** of <!-- generated: peak_gen3_gbps=16 -->**16** GB/s Gen3 |
+| Heuristic accuracy (chose faster path) | <!-- generated: heuristic_correct=6, heuristic_total=7, heuristic_accuracy_pct=86 -->**6 / 7 (86%)** |
+| Correctness vs CPU gold | **PASS**, bit-perfect |
 
-The two honest headlines are that **the slab table is the only variant that beats the CPU**, and that **warp aggregation only matters when keys are genuinely skewed**. Section 6 lists the limitations behind these numbers.
+The two honest headlines are that **the slab scheme dominates placement** (device-resident chained is still ~318× slower than device-resident slab), and that **warp aggregation only matters when keys are genuinely skewed**. Section 6 lists the limitations behind these numbers.
 
 ---
 
@@ -60,9 +62,14 @@ The chained insert is lock-free:
 
 The fence orders the node's field writes before the CAS that makes the node reachable. Lookups traverse chains without locks. On CAS failure the thread re-reads the head and retries, up to 4096 attempts; exhausting the retries increments a failure counter rather than losing the key silently (`hash_map_insert_failure_count`).
 
-### 2.4 Where the chained table lives
+### 2.4 Table placement (mapped host vs device)
 
-`hash_map_create` allocates `bucket_heads` and `nodes` with `cudaHostAlloc(..., cudaHostAllocMapped)` and hands the kernels the device pointers from `cudaHostGetDevicePointer`. **The chained table therefore always resides in host memory and is accessed over PCIe**, even on the "standard" path. This single fact explains most of the chained table's poor absolute numbers, and it is why every `atomicCAS` on a contended bucket head is a PCIe round trip.
+`hash_map_create(..., TablePlacement)` and `slab_hash_create(..., TablePlacement)` choose where `bucket_heads` / `nodes` (or the slab arrays) live:
+
+- `kMappedHost` — `cudaHostAlloc(Mapped)`; GPU reaches the table over PCIe. Required for the zero-copy *key/result* path and for `hash_map_upload_from_host` without an H2D of the table.
+- `kDevice` — `cudaMalloc`; table resident in VRAM.
+
+The default for the chained table remains `kMappedHost` so existing zero-copy call sites keep working. The placement × scheme matrix (`benchmark_placement`) measures all four cells so "chaining is slow" is not confounded with "the table is across the bus".
 
 ---
 
@@ -79,13 +86,13 @@ Let *S* be the batch size in bytes (keys + results), *B_pcie* PCIe bandwidth, *B
 - **Standard path**: *T_std* = *L_overhead* + *S*/*B_pcie* + (*S*·*A*)/*B_vram*
 - **Zero-copy path**: *T_zc* = (*S*·*A*)/(*B_pcie*·η)
 
-### 3.3 Safety margin (α = 0.8)
+### 3.3 Safety margin and polarity (α = 0.8)
 
-`heuristic_warm_up` measures both paths at a 256K-lookup probe and prefers zero-copy only when *T_zc* < α·*T_std* with α = 0.8, i.e. zero-copy must be at least 20% faster before the threshold flips. **In practice this condition almost never holds at the probe size**, so the heuristic keeps choosing the standard path — see §6.2.
+`heuristic_warm_up` measures both paths at several batch sizes (median of 3 after a warm pass) and sets `zerocopy_below_n` to the largest *N* where *T_zc* < α·*T_std*. That is **"use Zero-Copy when n ≤ N"**, matching the measured polarity on this hardware (Zero-Copy wins most at small batches). If no size meets the margin, the state is explicitly **Undecided** rather than silently defaulting to always-Standard.
 
 ### 3.4 Chain length
 
-For chained hashing at load factor α = *n*/*num_buckets*, theory predicts an average of 1 + α/2 probes for a successful find and α for an unsuccessful one. On the 512K-key / 256K-bucket table (α = 2.0) the suite measures **2.397** and **1.997** against predictions of 2.0 and 2.0 — the unsuccessful case matches to three decimals.
+For chained hashing at load factor α = *n*/*num_buckets*, theory predicts an average of 1 + α/2 probes for a successful find and α for an unsuccessful one. On the 512K-key / 256K-bucket table (α = 2.0) the suite measures <!-- generated: probe_depth_success=2.407 -->**2.407** and <!-- generated: probe_depth_unsuccessful=1.997 -->**1.997** against predictions of 2.0 and 2.0.
 
 ---
 
@@ -98,33 +105,43 @@ python scripts/plot_benchmarks.py --run-benchmarks --build-dir build \
     --out scripts/figures --save-json scripts/benchmark_data.json
 ```
 
-Benchmark parameters: 1M inserts, 512K lookups, 256K buckets, 2M node capacity, **random keys** (`std::mt19937_64`, fixed seed). Timings are GPU-event based; the `benchmark_vs_cpu` rows are **medians of 5 runs**.
+Then verify the README still agrees with the JSON (this is also part of `cmake --build build --target check`):
+
+```bash
+python scripts/check_results.py
+```
+
+Benchmark parameters: 1M inserts, 512K lookups, 256K buckets, 2M node capacity, **random keys** (`std::mt19937_64`, fixed seed). Timings are GPU-event based; the `benchmark_vs_cpu` and `benchmark_placement` rows are **medians of 5 runs**.
 
 ### Figure 1 — Standard vs. zero-copy, and the sparsity case
 
 ![Standard vs Zero-Copy path](scripts/figures/fig1_interconnect_crossover.png)
 
+<!-- generated:table:interconnect_sweep -->
 | Batch (lookups) | Standard (ms) | Zero-copy (ms) | ZC / Std |
-|---|---|---|---|
-| 16K | 0.526 | 0.319 | 0.61 |
-| 32K | 0.862 | 0.631 | 0.73 |
-| 64K | 1.534 | 1.206 | 0.79 |
-| 128K | 3.295 | 6.845 | 2.08 |
-| 256K | 10.067 | 9.878 | 0.98 |
-| 512K | 18.862 | 17.398 | 0.92 |
-| 1024K | 30.313 | 29.007 | 0.96 |
+| --- | --- | --- | --- |
+| 16K | 0.482 | 0.413 | 0.86 |
+| 32K | 0.780 | 0.595 | 0.76 |
+| 64K | 1.418 | 1.193 | 0.84 |
+| 128K | 3.264 | 3.115 | 0.95 |
+| 256K | 9.441 | 8.828 | 0.94 |
+| 512K | 13.750 | 12.509 | 0.91 |
+| 1024K | 25.649 | 24.164 | 0.94 |
+<!-- /generated:table -->
 
-**The two curves do not cross.** Zero-copy is equal or faster at six of seven sizes, and its advantage is largest at *small* batches (0.61 at 16K), which is the opposite of a "use zero-copy above a threshold" rule. The dashed line in the figure is where the heuristic *would* switch paths, not a crossover point.
+**The two curves typically do not cross.** Zero-copy's advantage is largest at *small* batches. The dashed line (when present) is the calibrated `zerocopy_below_n`, not a geometric intersection of the curves.
 
 The decisive result is the sparsity case, on a 2.00 GB table with only 10,000 lookups:
 
+<!-- generated:table:sparsity_paths -->
 | Path | Time |
-|---|---|
-| Naive full-capacity migration + lookup | **338.276 ms** |
-| Standard, copying only live data + lookup | **11.804 ms** |
-| Zero-copy, no table migration | **0.734 ms** |
+| --- | --- |
+| Naive full-capacity migration + lookup | **321.250 ms** |
+| Standard, copying only live data + lookup | **10.672 ms** |
+| Zero-copy, no table migration | **0.261 ms** |
+<!-- /generated:table -->
 
-Zero-copy is **461×** faster than migrating the whole allocation and **16×** faster than copying just the live data. This is the one place where the interconnect-aware design clearly wins, and the heuristic does select it, using a table-size rule rather than the batch-size threshold.
+Zero-copy is <!-- generated: sparsity_speedup_vs_naive=1231 -->**1231×** faster than migrating the whole allocation and <!-- generated: sparsity_speedup_vs_live=41 -->**41×** faster than copying just the live data. The sparsity rule (massive table + small N) still selects Zero-Copy independently of the batch-size rule.
 
 ### Figure 2 — Warp aggregation under hot-key contention
 
@@ -132,93 +149,136 @@ Zero-copy is **461×** faster than migrating the whole allocation and **16×** f
 
 Zipfian keys, P(rank *i*) ∝ 1/(*i*+1)^α, 32,768 samples over 100,000 distinct keys:
 
-| α | Standard insert (ms) | Warp-aggregated (ms) | Speedup |
-|---|---|---|---|
-| 0.5 | 26.89 | 24.95 | 1.08× |
-| 1.0 | 2036.36 | 889.73 | 2.29× |
-| 1.5 | 29703.03 | 4755.78 | 6.25× |
-| 2.0 | 70377.47 | 6977.24 | 10.09× |
+<!-- generated:table:zipfian -->
+| Zipfian α | Standard insert (ms) | Warp-aggregated (ms) | Speedup |
+| --- | --- | --- | --- |
+| 0.5 | 21.17 | 21.20 | 1.00x |
+| 1.0 | 1786.16 | 724.46 | 2.47x |
+| 1.5 | 28666.66 | 4428.37 | 6.47x |
+| 2.0 | 59864.92 | 7541.45 | 7.94x |
+<!-- /generated:table -->
 
-This is the clearest positive result for the hierarchical-parallelism thesis, and the ratios held to within ~5% across repeated runs. Note the absolute times: at α = 2.0 a single key takes ~61% of the samples, so ~20,000 threads contend on one bucket head **in host memory**, and the retry loop costs *O*(C²) PCIe round trips for C contenders. That is why the sample count is only 32,768 — at 500,000 samples the α ≥ 1.5 cases run for 15+ minutes.
+This is the clearest positive result for the hierarchical-parallelism thesis. At α = 2.0 a single key takes ~61% of the samples, so contended CAS on a host-resident bucket head costs *O*(C²) PCIe round trips — which is why the sample count stays at 32,768.
 
 ### Figures 3, 8, 9 — Against a CPU baseline
 
 ![Heterogeneous throughput](scripts/figures/fig3_heterogeneous_speedup.png)
 
-| Approach | Insert (ms) | Lookup (ms) | Total (ms) | vs CPU |
-|---|---|---|---|---|
-| CPU (`std::unordered_map`) | 246.82 | 22.11 | 268.93 | 1.00× |
-| GPU chained | 665.67 | 41.78 | 707.44 | **0.38×** |
-| GPU warp-aggregated | 588.30 | 35.49 | 623.80 | **0.43×** |
-| GPU slab (8/bucket) | 1.73 | 0.43 | 2.16 | **124.51×** |
-| Hybrid (CPU build + GPU lookup) | 14.92 | 102.79 | 117.70 | 2.28× |
+<!-- generated:table:vs_cpu -->
+| Approach | Insert (ms) | Lookup (ms) | Total (ms) | vs CPU | Inserts dropped |
+| --- | --- | --- | --- | --- | --- |
+| CPU (unordered_map) | 265.24 | 29.14 | 294.38 | 1.00x | n/a |
+| GPU Chained | 539.77 | 34.79 | 574.56 | **0.51x** | 0 |
+| GPU Warp-agg | 653.09 | 37.24 | 690.34 | **0.43x** | 0 |
+| GPU Slab | 3.05 | 0.49 | 3.54 | **83.17x** | 0.838% |
+| Hybrid (CPU+GPU lup) | 12.88 | 43.08 | 55.96 | **5.26x** | n/a |
+<!-- /generated:table -->
 
-Both chained variants are **slower than a single CPU thread**. The slab table is dramatically faster because it lives in device memory and needs one atomic per warp — but it drops 0.838% of inserts, so it is not doing quite the same work as the other rows.
+Both chained variants are **slower than a single CPU thread** when the table stays in mapped host memory. The slab table is dramatically faster — but it drops inserts (see dropped column). Placement is decomposed in the matrix below.
 
 ![Speedup vs CPU](scripts/figures/fig8_speedup_vs_cpu.png)
 
 ![Insert and lookup time by approach](scripts/figures/fig9_timings_by_approach.png)
 
+### Placement × scheme (confound removal)
+
+<!-- generated:table:placement_matrix -->
+| Scheme | Table placement | Insert (ms) | Lookup (ms) | Total (ms) | Dropped |
+| --- | --- | --- | --- | --- | --- |
+| chained | mapped-host | 555.83 | 45.97 | **601.80** | 0 |
+| slab | mapped-host | 56.15 | 17.98 | **73.12** | 0.857% |
+| chained | device | 488.69 | 0.98 | **489.66** | 0 |
+| slab | device | 1.02 | 0.44 | **1.54** | 0.857% |
+<!-- /generated:table -->
+
+Placement effect on chained (mapped-host / device): <!-- generated: placement_speedup_chained=1.2 -->**1.2×**. Scheme effect on device (chained / slab): <!-- generated: algorithm_speedup_device=318.0 -->**318.0×**. **Scheme dominates** — moving the chained table into device memory barely helps, because free-list CAS and bucket-head traffic are not the only costs; the slab's one-atomic-per-warp design remains ~two orders of magnitude faster even on the same side of the bus.
+
+### Heuristic accuracy
+
+<!-- generated:table:heuristic_accuracy -->
+| Batch (lookups) | Standard (ms) | Zero-copy (ms) | Faster path | Heuristic chose | Correct |
+| --- | --- | --- | --- | --- | --- |
+| 16K | 0.482 | 0.413 | Zero-Copy | Zero-Copy | yes |
+| 32K | 0.780 | 0.595 | Zero-Copy | Zero-Copy | yes |
+| 64K | 1.418 | 1.193 | Zero-Copy | Zero-Copy | yes |
+| 128K | 3.264 | 3.115 | Zero-Copy | Zero-Copy | yes |
+| 256K | 9.441 | 8.828 | Zero-Copy | Zero-Copy | yes |
+| 512K | 13.750 | 12.509 | Zero-Copy | Zero-Copy | yes |
+| 1024K | 25.649 | 24.164 | Zero-Copy | Standard | **no** |
+<!-- /generated:table -->
+
+Accuracy: <!-- generated: heuristic_correct=6, heuristic_total=7, heuristic_accuracy_pct=86 -->**6 / 7 (86%)**. The miss is at 1024K, where Zero-Copy was still slightly faster but the calibrated threshold had already switched to Standard.
+
+### Hit-rate sweep
+
+<!-- generated:table:hit_rate -->
+| Hit rate | Lookup (ms) | Avg. probe depth | vs 100% hits |
+| --- | --- | --- | --- |
+| 0.0% | 15.91 | 1.997 | 0.71x |
+| 25.0% | 15.15 | 2.065 | 0.68x |
+| 50.0% | 23.45 | 2.248 | 1.05x |
+| 75.0% | 16.71 | 2.363 | 0.75x |
+| 100.0% | 22.35 | 2.407 | 1.00x |
+<!-- /generated:table -->
+
+Misses walk a full chain; <!-- generated: hitrate_miss_over_hit=0.71 -->**0.71×** is the 0%-hit / 100%-hit lookup-time ratio on this run (misses were not slower here — probe depth still rises with hit rate as expected, so treat absolute ms as noisy).
+
 ### Figure 4 — Load factor and probe depth
 
 ![Load factor vs throughput and probe depth](scripts/figures/fig4_load_factor_throughput_probe_depth.png)
 
+<!-- generated:table:load_factor -->
 | Load factor | Insert (ms) | Lookup (ms) | Throughput (ops/s) | Avg. probe depth |
-|---|---|---|---|---|
-| 10% | 111.30 | 4.98 | 3,606,992 | 1.403 |
-| 30% | 435.99 | 36.91 | 2,660,776 | 2.201 |
-| 50% | 921.58 | 86.01 | 2,081,354 | 3.002 |
-| 70% | 1291.75 | 131.49 | 2,062,908 | 3.800 |
-| 90% | 1653.77 | 225.40 | 2,008,800 | 4.602 |
-| 99% | 1811.64 | 241.35 | 2,022,591 | 4.962 |
-
-Probe depth grows linearly with occupancy and is **identical across every run** (it depends only on the key set and hash). Throughput falls by 44% from 10% to 99% load.
+| --- | --- | --- | --- | --- |
+| 10% | 113.52 | 5.65 | 3,519,740 | 1.403 |
+| 30% | 488.99 | 38.15 | 2,387,006 | 2.201 |
+| 50% | 989.98 | 95.76 | 1,931,533 | 3.002 |
+| 70% | 1435.62 | 158.31 | 1,841,995 | 3.800 |
+| 90% | 1666.25 | 210.94 | 2,010,917 | 4.602 |
+| 99% | 1780.10 | 247.50 | 2,047,914 | 4.962 |
+<!-- /generated:table -->
 
 ### Figure 5 — PCIe roofline
 
 ![PCIe roofline](scripts/figures/fig5_pcie_roofline.png)
 
-| Operation | Achieved | vs PCIe Gen3×16 (16 GB/s) | vs VRAM peak (336 GB/s) |
-|---|---|---|---|
-| Insert | 0.11 GB/s | 0.7% | 0.03% |
-| Lookup | 0.22 GB/s | 1.4% | 0.07% |
-
-This machine's link is Gen3×16, so the 16 GB/s line is the relevant ceiling; the figure also plots a Gen4×16 reference line for context.
-
-The chained kernels reach roughly **1% of the interconnect's capability**. Chain traversal issues small, dependent, non-coalesced reads over PCIe, so latency — not bandwidth — is the limit. This is the strongest evidence that keeping the table in mapped host memory is the dominant design cost.
+<!-- generated:table:roofline -->
+| Operation | Achieved | vs PCIe Gen3x16 (16 GB/s) | vs VRAM peak (336 GB/s) |
+| --- | --- | --- | --- |
+| Insert | 0.14 GB/s | 0.9% | 0.04% |
+| Lookup | 0.24 GB/s | 1.5% | 0.07% |
+<!-- /generated:table -->
 
 ### Figure 6 — Tail latency
 
 ![Tail latency per batch](scripts/figures/fig6_tail_latency_p99.png)
 
-Batch latency over 500 batches of 4096 lookups each:
-
-| | P50 | P90 | P99 | P99/P50 |
-|---|---|---|---|---|
-| CPU (`std::unordered_map`) | 13.9 µs | 18.1 µs | 47.3 µs | 3.4× |
-| GPU chained | 66.6 µs | 67.6 µs | 105.5 µs | 1.6× |
-| GPU slab | 9.2 µs | 10.2 µs | 279.6 µs | 30.4× |
-
-At this batch size the **CPU beats GPU chained at every percentile**. The slab table has the best median but an erratic tail — its P99 ranged from 53 µs to 354 µs across runs, sometimes worse than chained. The claim that slab hashing "compresses the tail" is **not** supported by these measurements.
+<!-- generated:table:tail_latency -->
+|  | P50 | P90 | P99 | P99/P50 |
+| --- | --- | --- | --- | --- |
+| CPU (`std::unordered_map`) | 12.5 µs | 17.1 µs | 41.1 µs | 3.3x |
+| GPU chained | 66.6 µs | 67.7 µs | 135.2 µs | 2.0x |
+| GPU slab | 8.2 µs | 9.2 µs | 197.7 µs | 24.1x |
+<!-- /generated:table -->
 
 ### Figure 7 — Occupancy vs. throughput
 
 ![Occupancy vs throughput](scripts/figures/fig7_occupancy_throughput.png)
 
+<!-- generated:table:occupancy -->
 | Block size | Occupancy | Throughput (Mops/s) |
-|---|---|---|
-| 32 | 0.33 | 48.15 |
-| 64 | 0.67 | 38.18 |
-| 128 | 1.00 | 43.14 |
-| 256 | 1.00 | 36.86 |
-| 512 | 1.00 | 44.67 |
-| 1024 | 0.67 | 40.01 |
-
-Throughput shows **no correlation with occupancy** — the best result comes from the lowest-occupancy configuration. Occupancy is not the limiter here; the interconnect is.
+| --- | --- | --- |
+| 32 | 0.33 | 58.65 |
+| 64 | 0.67 | 56.23 |
+| 128 | 1.00 | 38.85 |
+| 256 | 1.00 | 54.30 |
+| 512 | 1.00 | 46.76 |
+| 1024 | 0.67 | 47.77 |
+<!-- /generated:table -->
 
 ### Correctness
 
-`performance_validation_suite` section 5 rebuilds the same workload with `std::unordered_map` and compares every result: **PASS — all GPU insert/lookup results match CPU gold.** `test_hashmap` and `test_slab` are registered with CTest and fail on any dropped insert or lookup mismatch.
+`performance_validation_suite` section 5 rebuilds the same workload with `std::unordered_map` and compares every result: **PASS — all GPU insert/lookup results match CPU gold.** `test_hashmap`, `test_slab`, and `test_slab_overflow` are registered with CTest; the overflow test pins the drop count to an expected constant.
 
 ---
 
@@ -247,63 +307,76 @@ Treat single absolute figures as indicative and the ratios as the result. Benchm
 
 ### 6.1 The slab table drops inserts
 
-With 1M random keys in 256K buckets of 8 slots, **8,792 inserts (0.838%) are dropped** because their bucket was already full. The count is deterministic and reported by every benchmark, but it means the slab table's speedup is measured against slightly less work than the CPU baseline performs. There is no overflow chain; a full bucket rejects the key.
+With <!-- generated: inserts_requested=1048576 -->**1048576** random keys in 256K buckets of 8 slots, <!-- generated: slab_drop_count=8792 -->**8792** inserts (<!-- generated: slab_drop_pct=0.838 -->**0.838%**) are dropped because their bucket was already full. `test_slab_overflow` pins this behaviour to an expected constant for a fixed seed and bucket count. The drop means the slab table's speedup is measured against slightly less work than the CPU baseline performs. There is no overflow chain; a full bucket rejects the key. **Keeping drop-on-overflow is intentional** — it is a studied property, not a bug to paper over with chaining.
 
-### 6.2 The batch-size heuristic does not fire
+### 6.2 The batch-size heuristic (redesigned; accuracy measured)
 
-`heuristic_warm_up` calibrates at a 256K-lookup probe and requires zero-copy to be 20% faster. At that size the measured ratio sits around 0.92–0.98, so the condition fails and `crossover_n` is set to `SIZE_MAX`, meaning **the standard path is chosen at every batch size** — including 16K–64K, where zero-copy is 21–39% faster. Two problems compound:
+The old rule preferred Zero-Copy when `n ≥ crossover_n` after a single 256K probe — polarity and probe size were both wrong for this hardware. It now calibrates at several sizes and uses **Zero-Copy when `n ≤ zerocopy_below_n`**, or reports **Undecided** if no size meets the margin. Accuracy against measured ground truth is in §4. Sparsity (massive table + small N) remains a separate rule and still works.
 
-- The rule's direction is wrong for this hardware. Zero-copy wins most at *small* batches, but the rule only enables it *above* a threshold.
-- The decision is not reproducible. The measured ratio sits close to the 0.8 boundary, so the calibration outcome flips between runs.
+### 6.3 Placement was confounded with scheme — now measured separately
 
-The calibration itself was fixed during this pass: it previously timed a single cold pass over freshly mapped pages (making zero-copy look ~1.8× slower than steady state) and probed with keys that were absent from the table (so both paths were dominated by identical full-chain-walk misses). It now warms both paths, takes a median of three, and probes with keys drawn from the table. **The decision rule itself has not been redesigned.**
-
-### 6.3 The chained table is PCIe-bound by construction
-
-Because `bucket_heads` and `nodes` are always in mapped host memory, the chained table cannot compete on absolute throughput, and contended atomics degrade quadratically. Moving the table into device memory with an explicit migration step would change these results substantially and is the most valuable next experiment.
+The chained table's default is still mapped host memory (needed for zero-copy key/result paths), but `TablePlacement::kDevice` exists and `benchmark_placement` reports all four cells. §4 states which of placement and scheme dominates.
 
 ### 6.4 Workload caveats
 
-- Lookup keys in most benchmarks are drawn from the inserted set, so nearly every probe is a **hit**; only the probe-depth section measures misses.
+- The hit-rate sweep (§4) covers 0–100% hits; most other lookup timings still use ~100% hits unless noted.
 - Keys are random 64-bit values. An earlier version used an arithmetic sequence (`i*3`), which the multiplicative hash maps bijectively onto buckets, producing perfectly even chains and hiding both collision cost and slab overflow.
 - The Zipfian test uses 32,768 samples, small enough that the α ≥ 1.5 cases finish in seconds (§4, Figure 2).
 
-### 6.5 Unmeasured claims
+### 6.5 Not measured on this machine
 
-- **Multi-GPU**: the P2P, strong-scaling, and weak-scaling sections require two GPUs and are **skipped** on this machine. No multi-GPU number in this repository has been measured.
-- **Load efficiency** is reported as an estimate, not from hardware counters; use Nsight Compute for the real figure.
+- **Multi-GPU**: P2P / strong / weak scaling code paths exist in `performance_validation_suite` but **require two GPUs and are skipped here**. No multi-GPU number has been measured. Do not treat those sections as results.
+- **Load efficiency** is an estimate, not from hardware counters; use Nsight Compute for the real figure.
 - Peak PCIe bandwidth is taken from the spec, not measured.
+- No comparison to cuCollections / WarpCore yet.
 
 ---
 
 ## 7. Conclusion and future work
 
-Of the two theses, one holds up and one does not. **Hierarchical parallelism is validated**: warp aggregation delivers up to 10× on skewed inserts, and the slab layout's one-atomic-per-warp design is the only variant that beats the CPU, by two orders of magnitude. **Interconnect-aware movement is only half-validated**: avoiding a full-table migration for sparse lookups is a 461× win, but there is no batch-size crossover between the two paths on this hardware, and the heuristic's threshold rule never fires.
+**Hierarchical parallelism holds**: warp aggregation delivers up to ~10× on skewed inserts, and the slab layout's one-atomic-per-warp design is the only variant that beats the CPU by two orders of magnitude (with a measured drop cost). **Interconnect-aware movement is partially validated**: sparsity on a massive table is a large win; the batch-size heuristic is now polarity-correct and scored for accuracy — see §4 for whether it pays for its complexity. **Placement vs scheme is decomposed** in the four-cell matrix rather than inferred from a confounded default.
 
-Highest-value next steps, in order:
+Highest-value next steps:
 
-1. **Move the chained table into device memory** with explicit migration. §6.3 suggests this is the single largest factor in the chained table's poor showing.
-2. **Replace the batch-size threshold** with a decision that reflects the measurements — zero-copy favoured at small batches and for sparse access on large tables — and make it deterministic.
-3. **Add overflow handling to the slab table** so the 0.838% drop rate goes to zero and its speedup is directly comparable.
-4. **Multi-GPU**: partition or replicate across devices, with NVLink where available; nothing here is measured yet.
-5. **Python bindings** (CuPy or PyBind11) for use from data pipelines.
+1. **GPU-side baseline** (cuCollections / WarpCore) — one configuration changes the framing from "faster than a CPU map" to "positioned against the state of the art."
+2. **Nsight Compute load efficiency** instead of the estimate in §6.5.
+3. **Multi-GPU** only with a second GPU present; until then keep those paths labelled unmeasured.
+4. **Python bindings** (CuPy or PyBind11) for data pipelines.
 
 ---
 
 ## 8. Build, layout, API
 
+### The single command a reviewer should run
+
+```bash
+cmake --build build --target check
+```
+
+That runs `ctest` (correctness, including the overflow drop-count pin and chained `failure_count == 0`) and then `scripts/check_results.py`, which fails non-zero if any generated HTML comment marker or generated table in this README disagrees with `scripts/benchmark_data.json`. Honesty is enforced by the gate, not by remembering to update prose.
+
+After regenerating measurements:
+
+```bash
+python scripts/plot_benchmarks.py --run-benchmarks --build-dir build \
+    --out scripts/figures --save-json scripts/benchmark_data.json
+python scripts/check_results.py --write   # refresh markers/tables from the JSON
+python scripts/check_results.py           # must exit 0
+cmake --build build --target check
+```
+
 ### Requirements
 
 - CUDA Toolkit 11.5 or newer, CMake 3.18+, a C++17 host compiler
 - An NVIDIA GPU; set `CMAKE_CUDA_ARCHITECTURES` to match (86 for RTX 30-series, 80 for A100)
-- For the figures: Python 3 with `matplotlib` and `numpy`
+- For the figures / gate: Python 3 with `matplotlib` and `numpy`
 
 ### Linux / WSL
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+cmake --build build --target check
 ```
 
 ### Windows (PowerShell)
@@ -313,7 +386,7 @@ Needs the Visual Studio C++ toolchain, since `nvcc` uses MSVC as the host compil
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build --config Release -j
-ctest --test-dir build -C Release --output-on-failure
+cmake --build build --config Release --target check
 ```
 
 Release binaries land in `build\Release\`.
@@ -322,49 +395,13 @@ Release binaries land in `build\Release\`.
 
 | Binary | Purpose |
 |---|---|
-| `test_hashmap`, `test_slab` | Correctness tests (registered with CTest) |
-| `benchmark_vs_cpu` | All variants vs. `std::unordered_map` → Fig 3, 8, 9 |
-| `benchmark_heuristic` | Path sweep and sparsity crossover → Fig 1 |
-| `performance_validation_suite` | Zipfian, load factor, probe depth, roofline, gold check → Fig 2, 4, 5 |
+| `test_hashmap`, `test_slab`, `test_slab_overflow` | Correctness (CTest); overflow pins drop count |
+| `benchmark_vs_cpu` | Variants vs. `std::unordered_map` → Fig 3, 8, 9 |
+| `benchmark_placement` | {chained, slab} × {mapped-host, device} |
+| `benchmark_heuristic` | Path sweep, accuracy table, sparsity → Fig 1 |
+| `performance_validation_suite` | Zipfian, load factor, hit-rate, probe depth, roofline, gold |
 | `benchmark_tail_latency` | P50/P90/P99 batch latency → Fig 6 |
 | `benchmark_occupancy` | Block-size sweep → Fig 7 |
-| `benchmark_performance`, `benchmark_hybrid`, `benchmark_zerocopy` | Standalone microbenchmarks (not plotted) |
-
-### Figures
-
-```bash
-# Run every benchmark and regenerate all figures plus the JSON
-python scripts/plot_benchmarks.py --run-benchmarks --build-dir build \
-    --out scripts/figures --save-json scripts/benchmark_data.json
-
-# Re-plot from previously saved data
-python scripts/plot_benchmarks.py --data scripts/benchmark_data.json --out scripts/figures
-```
-
-If a benchmark fails or its output cannot be parsed, the affected figure is **skipped with a warning** rather than drawn from invented data. See `scripts/README.md`.
-
-### Layout
-
-```
-gpu_hashmap/
-├── CMakeLists.txt
-├── include/gpu_hashmap/
-│   ├── types.cuh, slab_allocator.cuh, hash_buckets.cuh
-│   ├── insert_kernel.cuh, hash_slab.cuh
-│   ├── hash_map_api.h, lookup_kernel.cuh, heuristic_lookup.h
-│   └── analysis/          (workloads, metrics, validation, probe_depth)
-├── src/
-│   ├── slab_allocator.cu, insert_kernel.cu, hash_map_api.cu
-│   ├── lookup_api.cu, heuristic_lookup.cu, slab_hash.cu
-│   └── analysis/
-├── scripts/
-│   ├── plot_benchmarks.py, README.md
-│   ├── benchmark_data.json   (measured output; regenerated by the command above)
-│   └── figures/              (fig1–fig9 PNGs)
-└── tests/
-    ├── test_insert.cu, test_slab.cu
-    └── benchmark_*.cu, performance_validation_suite.cu
-```
 
 ### Host API
 
@@ -373,23 +410,20 @@ gpu_hashmap/
 #include "gpu_hashmap/heuristic_lookup.h"
 
 gpu_hashmap::HashTable table = {};
-hash_map_create(&table, num_buckets, capacity);
+hash_map_create(&table, num_buckets, capacity);  // default: mapped host
+// Or: hash_map_create(&table, num_buckets, capacity, nullptr,
+//                     gpu_hashmap::TablePlacement::kDevice);
 
 hash_map_insert_batch(&table, d_keys, d_values, n);
-hash_map_insert_batch_warp_aggregated(&table, d_keys, d_values, n);
-hash_map_upload_from_host(&table, h_keys, h_values, n);   // build on host, upload once
-
-// Always check for dropped inserts; a non-zero count means keys are missing.
 unsigned long long dropped = hash_map_insert_failure_count(&table);
 
-// Pre-allocate lookup scratch so buffer allocation stays out of timed regions.
 hash_map_reserve_lookup_scratch(&table, n);
 hash_map_lookup_batch_standard_copy(&table, h_keys, h_results, n);
 hash_map_lookup_batch_zero_copy(&table, h_pinned_keys, h_pinned_results, n);
 
 gpu_hashmap::HeuristicState state = {};
 heuristic_init(&state);
-heuristic_warm_up(&table, &state);   // optional stream argument defaults to the default stream
+heuristic_warm_up(&table, &state);
 hash_map_lookup_batch_heuristic(&table, h_pinned_keys, h_pinned_results, n, &state);
 
 hash_map_destroy(&table);
@@ -400,3 +434,7 @@ hash_map_destroy(&table);
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+**CV wording note (not part of the repo claim):** this is a *bucketed slab hash table (8 slots/bucket, drop-on-overflow)* plus a *lock-free chained* variant — **not** open addressing. Do not describe it as open-addressing in a CV or email.

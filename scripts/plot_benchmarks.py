@@ -92,7 +92,7 @@ def run_benchmark(build_dir: Path, exe: str, timeout_s: int = 300) -> str:
 
 
 def parse_heuristic(stdout: str) -> dict:
-    """Parse benchmark_heuristic: warm-up line, per-N sweep of BOTH paths, sparsity block.
+    """Parse benchmark_heuristic: warm-up, per-N sweep of BOTH paths, accuracy, sparsity.
 
     Every batch size in the sweep is measured on both paths, so nothing here is
     extrapolated. If the sweep table cannot be parsed, the caller is told (by the
@@ -100,23 +100,74 @@ def parse_heuristic(stdout: str) -> dict:
     """
     data = {"safety_margin_alpha": 0.8}
 
-    m = re.search(r"crossover_n=(\d+)", stdout)
+    m = re.search(r"Zero-Copy when n <= (\d+)", stdout)
     if m:
-        data["crossover_n"] = int(m.group(1))
+        data["zerocopy_below_n"] = int(m.group(1))
+        data["crossover_n"] = int(m.group(1))  # fig1 vertical line = ZC threshold
+        data["decided"] = True
+    elif re.search(r"UNDECIDED", stdout):
+        data["zerocopy_below_n"] = 0
+        data["crossover_n"] = (1 << 64) - 1
+        data["decided"] = False
+    else:
+        m_legacy = re.search(r"crossover_n=(\d+)", stdout)
+        if m_legacy:
+            data["crossover_n"] = int(m_legacy.group(1))
 
-    # Sweep rows: "  16384         0.412           0.398           Standard        0.97"
+    # Sweep (human table): N Std ZC Faster Chosen Correct ZC/Std
     rows = re.findall(
-        r"^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s+(Standard|Zero-Copy)\s+([\d.]+)\s*$",
+        r"^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s+(Standard|Zero-Copy)\s+"
+        r"(Standard|Zero-Copy|Undecided)\s+(yes|no)\s+([\d.]+)\s*$",
         stdout,
         re.MULTILINE,
     )
-    if rows:
+    if not rows:
+        # Older 4-column format (pre accuracy columns)
+        rows_old = re.findall(
+            r"^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s+(Standard|Zero-Copy)\s+([\d.]+)\s*$",
+            stdout,
+            re.MULTILINE,
+        )
+        if rows_old:
+            rows_old.sort(key=lambda r: int(r[0]))
+            data["batch_sizes_n"] = [int(r[0]) for r in rows_old]
+            data["batch_sizes_k"] = [int(r[0]) / 1024.0 for r in rows_old]
+            data["standard_path_ms"] = [float(r[1]) for r in rows_old]
+            data["zerocopy_path_ms"] = [float(r[2]) for r in rows_old]
+            data["chosen_path"] = [r[3] for r in rows_old]
+    else:
         rows.sort(key=lambda r: int(r[0]))
         data["batch_sizes_n"] = [int(r[0]) for r in rows]
         data["batch_sizes_k"] = [int(r[0]) / 1024.0 for r in rows]
         data["standard_path_ms"] = [float(r[1]) for r in rows]
         data["zerocopy_path_ms"] = [float(r[2]) for r in rows]
-        data["chosen_path"] = [r[3] for r in rows]
+        data["chosen_path"] = [r[4] for r in rows]
+
+    # Machine-readable accuracy block
+    acc = re.search(r"HEURISTIC ACCURACY:\s+(\d+)\s*/\s*(\d+)", stdout)
+    if acc:
+        data_acc = {
+            "correct": int(acc.group(1)),
+            "total": int(acc.group(2)),
+            "rows": [],
+        }
+        for mrow in re.finditer(
+            r"^(\d+)\s+([\d.]+)\s+([\d.]+)\s+(Standard|Zero-Copy)\s+"
+            r"(Standard|Zero-Copy|Undecided)\s+(yes|no)\s*$",
+            stdout,
+            re.MULTILINE,
+        ):
+            data_acc["rows"].append(
+                {
+                    "n": int(mrow.group(1)),
+                    "standard_ms": float(mrow.group(2)),
+                    "zerocopy_ms": float(mrow.group(3)),
+                    "faster": mrow.group(4),
+                    "chosen": mrow.group(5),
+                    "correct": mrow.group(6) == "yes",
+                }
+            )
+        data["heuristic_accuracy"] = data_acc
 
     # Sparsity block: live-data migration, naive full-capacity migration, zero-copy
     std_live = re.search(r"Standard path \(live-data copy \+ lookup\):\s+([\d.]+)\s+ms", stdout)
@@ -129,6 +180,59 @@ def parse_heuristic(stdout: str) -> dict:
     if naive_full:
         data["sparsity_naive_full_migration_ms"] = float(naive_full.group(1))
     return data
+
+
+def parse_placement(stdout: str) -> dict:
+    """Parse benchmark_placement machine-readable matrix."""
+    rows = []
+    for m in re.finditer(
+        r"^(chained|slab)\s+(mapped-host|device)\s+"
+        r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*$",
+        stdout,
+        re.MULTILINE,
+    ):
+        rows.append(
+            {
+                "scheme": m.group(1),
+                "placement": m.group(2),
+                "insert_ms": float(m.group(3)),
+                "lookup_ms": float(m.group(4)),
+                "total_ms": float(m.group(5)),
+                "total_p05": float(m.group(6)),
+                "total_p95": float(m.group(7)),
+                "dropped_pct": float(m.group(8)),
+            }
+        )
+    n_runs = re.search(r"PLACEMENT MATRIX \(n_runs=(\d+)\)", stdout)
+    dominant = re.search(r"Dominant factor:\s+(.+)$", stdout, re.MULTILINE)
+    out: dict = {"rows": rows}
+    if n_runs:
+        out["n_runs"] = int(n_runs.group(1))
+    if dominant:
+        out["dominant"] = dominant.group(1).strip()
+    return out
+
+
+def parse_hit_rate(stdout: str):
+    rows = re.findall(
+        r"^(\d+(?:\.\d+)?)\s+([\d.]+)\s+([\d.]+)\s*$",
+        stdout.split("HIT RATE SWEEP")[-1] if "HIT RATE SWEEP" in stdout else "",
+        re.MULTILINE,
+    )
+    # Filter to plausible hit-rate percentages (0..100)
+    parsed = []
+    for pct, ms, pd in rows:
+        p = float(pct)
+        if 0.0 <= p <= 100.0:
+            parsed.append((p, float(ms), float(pd)))
+    if not parsed:
+        return None
+    parsed.sort(key=lambda r: r[0])
+    return {
+        "hit_rate_pct": [p for p, _, _ in parsed],
+        "lookup_ms": [ms for _, ms, _ in parsed],
+        "avg_probe_depth": [pd for _, _, pd in parsed],
+    }
 
 
 def parse_vs_cpu(stdout: str) -> dict:
@@ -151,6 +255,9 @@ def parse_vs_cpu(stdout: str) -> dict:
         "speedup_x": [],
         "total_ops": 1536000,
         "cpu_per_find_us": None,
+        "dropped_inserts": {},
+        "dropped_pct": {},
+        "inserts_requested": None,
     }
     pattern = re.compile(
         r"^\s*(CPU \(unordered_map\)|GPU chained|GPU warp-aggregated|GPU slab \(8/bucket\)|Hybrid \(CPU\+GPU lup\))\s+"
@@ -177,6 +284,22 @@ def parse_vs_cpu(stdout: str) -> dict:
             "p90_us": float(cpu_lat.group(2)),
             "p99_us": float(cpu_lat.group(3)),
         }
+    # Dropped inserts are a headline limitation, so they belong in the data rather
+    # than only in the benchmark's stdout:
+    #   "  Inserts not stored (of 1048576 requested):"
+    #   "    GPU slab (8/bucket)         8792  (0.838%)"
+    req = re.search(r"Inserts not stored \(of (\d+) requested\)", stdout)
+    if req:
+        data["inserts_requested"] = int(req.group(1))
+    for m in re.finditer(
+        r"^\s{4,}(CPU \(unordered_map\)|GPU chained|GPU warp-aggregated|GPU slab \(8/bucket\))\s+"
+        r"(\d+)\s+\(([\d.]+)%\)",
+        stdout,
+        re.MULTILINE | re.IGNORECASE,
+    ):
+        label = display_names.get(m.group(1).strip().lower(), m.group(1).strip())
+        data["dropped_inserts"][label] = int(m.group(2))
+        data["dropped_pct"][label] = float(m.group(3))
     return data
 
 
@@ -309,12 +432,27 @@ def run_and_parse_all(build_dir: Path) -> dict:
         out = run_benchmark(build_dir, "benchmark_heuristic")
         parsed = parse_heuristic(out)
         if "standard_path_ms" in parsed:
-            data["interconnect"] = parsed
+            interconnect = {k: v for k, v in parsed.items() if k != "heuristic_accuracy"}
+            data["interconnect"] = interconnect
+            if "heuristic_accuracy" in parsed:
+                data["heuristic_accuracy"] = parsed["heuristic_accuracy"]
             print("Parsed benchmark_heuristic")
         else:
             failures.append("benchmark_heuristic: ran, but the sweep table did not parse")
     except Exception as e:
         failures.append(f"benchmark_heuristic: {e}")
+
+    # benchmark_placement -> placement_matrix (scheme x residency)
+    try:
+        out = run_benchmark(build_dir, "benchmark_placement", timeout_s=900)
+        pm = parse_placement(out)
+        if pm.get("rows"):
+            data["placement_matrix"] = pm
+            print("Parsed benchmark_placement")
+        else:
+            failures.append("benchmark_placement: ran, but the matrix did not parse")
+    except Exception as e:
+        failures.append(f"benchmark_placement: {e}")
 
     # benchmark_vs_cpu -> fig3, fig8, fig9 (+ CPU per-find latency for fig6)
     cpu_per_find_us_from_vs_cpu = None
@@ -354,6 +492,9 @@ def run_and_parse_all(build_dir: Path) -> dict:
         for k in ("probe_depth_success", "probe_depth_unsuccessful"):
             if vs.get(k) is not None:
                 data[k] = vs[k]
+        hr = parse_hit_rate(out)
+        if hr:
+            data["hit_rate"] = hr
         print("Parsed performance_validation_suite")
     except Exception as e:
         failures.append(f"performance_validation_suite: {e}")
@@ -450,7 +591,7 @@ def plot_interconnect_crossover(data: dict, outdir: Path) -> None:
     # heuristic switches paths, not a point where the faster path changes.
     if crossover_n_k is not None and x_min <= crossover_n_k <= x_max:
         ax.axvline(x=crossover_n_k, color="gray", linestyle="--", linewidth=1.5,
-                   label=f"Heuristic switches to Zero-Copy (N ≈ {int(round(crossover_n_k))}K)")
+                   label=f"Zero-Copy when N ≤ {int(round(crossover_n_k))}K (calibrated)")
 
     ax.set_xlabel("Batch size (thousands of lookups, log scale)")
     ax.set_ylabel("End-to-end latency (ms)")

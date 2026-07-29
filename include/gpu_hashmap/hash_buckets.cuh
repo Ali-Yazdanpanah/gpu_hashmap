@@ -45,6 +45,10 @@ struct HashTableDevice {
  * - h_bucket_heads / h_nodes: host-side of cudaHostAlloc(Mapped); GPU accesses via d_*.
  * - d_bucket_heads / d_nodes: device pointers from cudaHostGetDevicePointer (for kernels).
  * - d_device_table is a device copy of the descriptor; pass to insert/lookup kernels.
+ *
+ * Under TablePlacement::kDevice the h_* pointers are null: the table has no host-side
+ * view, so anything that walks it from the CPU (hash_map_upload_from_host, a manual
+ * full-table migration) requires kMappedHost.
  */
 struct HashTable {
   HashTableDevice device;           ///< host copy (device.bucket_heads/nodes = d_* for kernels)
@@ -58,6 +62,7 @@ struct HashTable {
   SlabAllocator* slab;
   size_t num_buckets;
   size_t capacity;
+  TablePlacement placement;         ///< where bucket_heads/nodes live; set by hash_map_create
 
   /* Reusable staging buffers for the standard-copy lookup path. Kept across calls
    * so that allocation never lands inside a timed region. Grown on demand. */

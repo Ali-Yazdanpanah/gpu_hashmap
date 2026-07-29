@@ -39,8 +39,14 @@ namespace gpu_hashmap {
 
 namespace {
 
-constexpr size_t kWarmUpProbeN = 256 * 1024;
-constexpr float kSafetyMargin = 0.8f;  /* Only use Zero-Copy if ZeroCopy_Total < Standard_Total * 0.8 */
+/* Probe sizes span the region where Zero-Copy historically wins (small N) and
+ * where the paths are close (256K+). The rule polarity is "ZC below N", so we
+ * need the low end of the sweep, not only a single large probe. */
+constexpr size_t kWarmUpProbeSizes[] = {
+    16 * 1024, 32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024};
+constexpr int kWarmUpProbeCount =
+    static_cast<int>(sizeof(kWarmUpProbeSizes) / sizeof(kWarmUpProbeSizes[0]));
+constexpr float kSafetyMargin = 0.8f;  /* ZC must be <= 0.8 * Standard to count */
 
 float median3(float const* v) {
   if (v[0] < v[1]) {
@@ -117,70 +123,85 @@ void measure_zerocopy_total(HashTable* table, KeyType* d_keys_mapped, ValueType*
 } // namespace
 
 void heuristic_warm_up(HashTable* table, HeuristicState* state, cudaStream_t stream) {
-  const size_t probe_n = kWarmUpProbeN;
   size_t free_vram = 0, total_vram = 0;
   CUDA_CHECK(cudaMemGetInfo(&free_vram, &total_vram));
-  /* Out-of-core: batch (keys+results) must fit in VRAM; use ~50% of free to leave room for table etc. */
   state->max_lookups_fit_vram = (free_vram / 2) / (sizeof(KeyType) + sizeof(ValueType));
 
-  /* Pre-allocate buffers (separate from measurement). */
+  const size_t max_n = kWarmUpProbeSizes[kWarmUpProbeCount - 1];
   const unsigned int pin_flags = cudaHostAllocMapped | cudaHostAllocPortable;
   void* h_pinned_keys = nullptr;
   void* h_pinned_vals = nullptr;
   KeyType* d_keys_mapped = nullptr;
   ValueType* d_vals_mapped = nullptr;
-  CUDA_CHECK(cudaHostAlloc(&h_pinned_keys, probe_n * sizeof(KeyType), pin_flags));
-  CUDA_CHECK(cudaHostAlloc(&h_pinned_vals, probe_n * sizeof(ValueType), pin_flags));
+  CUDA_CHECK(cudaHostAlloc(&h_pinned_keys, max_n * sizeof(KeyType), pin_flags));
+  CUDA_CHECK(cudaHostAlloc(&h_pinned_vals, max_n * sizeof(ValueType), pin_flags));
   CUDA_CHECK(cudaHostGetDevicePointer(&d_keys_mapped, h_pinned_keys, 0));
   CUDA_CHECK(cudaHostGetDevicePointer(&d_vals_mapped, h_pinned_vals, 0));
 
   KeyType* d_keys_std = nullptr;
   ValueType* d_vals_std = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_keys_std, probe_n * sizeof(KeyType)));
-  CUDA_CHECK(cudaMalloc(&d_vals_std, probe_n * sizeof(ValueType)));
+  CUDA_CHECK(cudaMalloc(&d_keys_std, max_n * sizeof(KeyType)));
+  CUDA_CHECK(cudaMalloc(&d_vals_std, max_n * sizeof(ValueType)));
 
-  /* Probe with keys taken from the table so calibration sees the cost of successful
-   * finds. Synthetic keys 0..probe_n-1 are almost all absent, and a miss walks an
-   * entire chain, so both paths were dominated by the same chain-walk cost and the
-   * ratio between them was squeezed toward 1.0. */
-  fill_probe_keys_from_table(table, static_cast<KeyType*>(h_pinned_keys), probe_n);
+  fill_probe_keys_from_table(table, static_cast<KeyType*>(h_pinned_keys), max_n);
 
-  /* One untimed pass per path before measuring. The zero-copy path touches freshly
-   * cudaHostAlloc'd mapped pages, and paying that first-touch mapping cost inside the
-   * timed region made zero-copy look slower than it is in steady state, which set
-   * crossover_n to SIZE_MAX and pinned every later batch to the standard path. */
+  /* First-touch warm so mapped pages are not paid inside the timed region. */
   float scratch_ms = 0.f;
   measure_standard_total(table, static_cast<KeyType const*>(h_pinned_keys),
-                         static_cast<ValueType*>(h_pinned_vals),
-                         d_keys_std, d_vals_std, probe_n, &scratch_ms, stream);
-  measure_zerocopy_total(table, d_keys_mapped, d_vals_mapped, probe_n, &scratch_ms, stream);
+                         static_cast<ValueType*>(h_pinned_vals), d_keys_std, d_vals_std,
+                         max_n, &scratch_ms, stream);
+  measure_zerocopy_total(table, d_keys_mapped, d_vals_mapped, max_n, &scratch_ms, stream);
 
   const int probe_reps = 3;
-  float std_samples[probe_reps], zc_samples[probe_reps];
-  for (int r = 0; r < probe_reps; ++r) {
-    measure_standard_total(table, static_cast<KeyType const*>(h_pinned_keys),
-                           static_cast<ValueType*>(h_pinned_vals),
-                           d_keys_std, d_vals_std, probe_n, &std_samples[r], stream);
-    measure_zerocopy_total(table, d_keys_mapped, d_vals_mapped, probe_n, &zc_samples[r], stream);
-  }
-  const float standard_total_ms = median3(std_samples);
-  const float zerocopy_total_ms = median3(zc_samples);
+  size_t best_below = 0;
+  bool any = false;
+  std::fprintf(stderr,
+               "[heuristic] warm-up (margin %.2f, median of %d): size  std_ms  zc_ms  ratio  keep?\n",
+               kSafetyMargin, probe_reps);
 
-  /* Free pre-allocated buffers. */
+  for (int i = 0; i < kWarmUpProbeCount; ++i) {
+    const size_t n = kWarmUpProbeSizes[i];
+    if (n > state->max_lookups_fit_vram) break;
+    float std_samples[3], zc_samples[3];
+    for (int r = 0; r < probe_reps; ++r) {
+      measure_standard_total(table, static_cast<KeyType const*>(h_pinned_keys),
+                             static_cast<ValueType*>(h_pinned_vals), d_keys_std, d_vals_std, n,
+                             &std_samples[r], stream);
+      measure_zerocopy_total(table, d_keys_mapped, d_vals_mapped, n, &zc_samples[r], stream);
+    }
+    const float std_ms = median3(std_samples);
+    const float zc_ms = median3(zc_samples);
+    const float ratio = zc_ms / (std_ms + 1e-9f);
+    const bool keep = (zc_ms < std_ms * kSafetyMargin);
+    std::fprintf(stderr, "  %7zu  %7.3f  %7.3f  %5.2f  %s\n", n, std_ms, zc_ms, ratio,
+                 keep ? "yes" : "no");
+    if (keep) {
+      best_below = n;
+      any = true;
+    }
+  }
+
   CUDA_CHECK(cudaFreeHost(h_pinned_keys));
   CUDA_CHECK(cudaFreeHost(h_pinned_vals));
   CUDA_CHECK(cudaFree(d_keys_std));
   CUDA_CHECK(cudaFree(d_vals_std));
 
-  /* Safety margin: only switch to Zero-Copy if ZeroCopy_Total < Standard_Total * 0.8. */
-  if (zerocopy_total_ms < standard_total_ms * kSafetyMargin) {
-    state->crossover_n = probe_n;  /* use Zero-Copy for n >= probe_n */
-  } else {
-    state->crossover_n = SIZE_MAX;  /* prefer Standard unless out-of-core */
-  }
+  /* Polarity: Zero-Copy for n <= best_below. If nothing met the margin, leave
+   * decided=false so callers see Undecided instead of a silent SIZE_MAX. */
+  state->zerocopy_below_n = any ? best_below : 0;
+  state->crossover_n = any ? best_below : SIZE_MAX; /* legacy field */
+  state->decided = any;
   state->warmed_up = true;
-  std::fprintf(stderr, "[heuristic] warm-up: Standard_Total=%.2f ms, ZeroCopy_Total=%.2f ms (margin 0.8) -> crossover_n=%zu, max_lookups_fit_vram=%zu\n",
-               standard_total_ms, zerocopy_total_ms, state->crossover_n, state->max_lookups_fit_vram);
+  if (any)
+    std::fprintf(stderr,
+                 "[heuristic] decided: Zero-Copy when n <= %zu; else Standard "
+                 "(max_lookups_fit_vram=%zu)\n",
+                 state->zerocopy_below_n, state->max_lookups_fit_vram);
+  else
+    std::fprintf(stderr,
+                 "[heuristic] UNDECIDED: no probe size met margin %.2f; batch-size "
+                 "rule will not pick Zero-Copy (max_lookups_fit_vram=%zu)\n",
+                 kSafetyMargin, state->max_lookups_fit_vram);
 }
 
 void hash_map_lookup_batch_heuristic(HashTable* table,
@@ -197,10 +218,16 @@ void hash_map_lookup_batch_heuristic(HashTable* table,
     if (sparsity_driven)
       std::printf("Sparsity detected: Zero-Copy chosen to bypass 2GB table migration tax.\n");
     else
-      std::printf("Heuristic chose Zero-Copy for %zu lookups to minimize end-to-end latency.\n", n);
+      std::printf("Heuristic chose Zero-Copy for %zu lookups (n <= %zu).\n", n,
+                  state->zerocopy_below_n);
+  } else if (path == LookupPath::Undecided) {
+    /* Execute Standard but do not pretend calibration picked it. */
+    hash_map_lookup_batch_standard_copy(table, h_keys, h_results, n, stream);
+    std::printf("Heuristic UNDECIDED for %zu lookups; falling back to Standard Copy.\n", n);
   } else {
     hash_map_lookup_batch_standard_copy(table, h_keys, h_results, n, stream);
-    std::printf("Heuristic chose Standard Copy for %zu lookups to minimize end-to-end latency.\n", n);
+    std::printf("Heuristic chose Standard Copy for %zu lookups (n > %zu).\n", n,
+                state->zerocopy_below_n);
   }
 }
 

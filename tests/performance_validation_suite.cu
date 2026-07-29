@@ -370,6 +370,62 @@ int main() {
   CUDA_CHECK(cudaFree(d_absent));
   CUDA_CHECK(cudaFree(d_depth));
 
+  // ---------- 2c2. Hit-rate sweep ----------
+  std::printf("--------------------------------------------------------------------------------\n");
+  std::printf("  2c2. HIT-RATE SWEEP (lookup cost vs fraction of present keys)\n");
+  std::printf("--------------------------------------------------------------------------------\n");
+  std::printf("  %-10s  %-12s  %-12s\n", "HitRate", "Lookup(ms)", "ProbeDepth");
+  {
+    std::vector<KeyType> mix(m_lookup);
+    std::vector<double> hit_pcts = {0.0, 0.25, 0.50, 0.75, 1.0};
+    KeyType* d_mix = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_mix, m_lookup * sizeof(KeyType)));
+    std::printf("HIT RATE SWEEP\n");
+    std::printf("%-10s %12s %12s\n", "hit_pct", "lookup_ms", "avg_probe");
+    for (double hr : hit_pcts) {
+      size_t n_hit = static_cast<size_t>(hr * m_lookup);
+      for (size_t i = 0; i < m_lookup; ++i) {
+        mix[i] = (i < n_hit) ? h_keys[i % n_default] : h_absent[i % m_lookup];
+      }
+      CUDA_CHECK(cudaMemcpy(d_mix, mix.data(), m_lookup * sizeof(KeyType), cudaMemcpyHostToDevice));
+      float lup_ms = 0.f;
+      cudaEvent_t e1, e2;
+      CUDA_CHECK(cudaEventCreate(&e1));
+      CUDA_CHECK(cudaEventCreate(&e2));
+      /* Warm once, then time. */
+      lookup_kernel_impl<<<(m_lookup + 255) / 256, 256>>>(table.d_device_table, d_mix,
+                                                          d_lookup_out, m_lookup);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaEventRecord(e1));
+      lookup_kernel_impl<<<(m_lookup + 255) / 256, 256>>>(table.d_device_table, d_mix,
+                                                          d_lookup_out, m_lookup);
+      CUDA_CHECK(cudaEventRecord(e2));
+      CUDA_CHECK(cudaEventSynchronize(e2));
+      CUDA_CHECK(cudaEventElapsedTime(&lup_ms, e1, e2));
+      CUDA_CHECK(cudaEventDestroy(e1));
+      CUDA_CHECK(cudaEventDestroy(e2));
+      double pd = 0.0;
+      {
+        unsigned int* d_pd = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_pd, m_lookup * sizeof(unsigned int)));
+        analysis::lookup_with_probe_depth<<<(m_lookup + 255) / 256, 256>>>(
+            table.d_device_table, d_mix, d_lookup_out, d_pd, m_lookup);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<unsigned int> hpd(m_lookup);
+        CUDA_CHECK(cudaMemcpy(hpd.data(), d_pd, m_lookup * sizeof(unsigned int),
+                              cudaMemcpyDeviceToHost));
+        double sum = 0;
+        for (size_t i = 0; i < m_lookup; ++i) sum += hpd[i];
+        pd = sum / static_cast<double>(m_lookup);
+        CUDA_CHECK(cudaFree(d_pd));
+      }
+      std::printf("  %-10.0f%%  %-12.2f  %-12.3f\n", hr * 100.0, lup_ms, pd);
+      std::printf("%-10.0f %12.2f %12.3f\n", hr * 100.0, lup_ms, pd);
+    }
+    CUDA_CHECK(cudaFree(d_mix));
+  }
+  std::printf("\n");
+
   // ---------- 2d. Sparsity-Driven Crossover (massive table + N=10,000) ----------
   /*
    * Crossover occurs when: Time(Full Table Copy) > Time(Sparse PCIe Stalls).
