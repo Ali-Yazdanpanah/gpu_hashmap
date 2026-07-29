@@ -21,6 +21,10 @@ static double percentile(std::vector<double>& sorted, double p) {
   return sorted[i] * (1.0 - frac) + sorted[i + 1] * frac;
 }
 
+/* The looked-up values must reach an observable location, or the optimiser deletes
+ * the whole probe loop as dead code and every CPU batch times at ~0.00003 ms. */
+volatile uint64_t cpu_lookup_sink = 0;
+
 void run_cpu_tail_latency(
     const std::vector<uint64_t>& keys,
     const std::vector<uint64_t>& values,
@@ -38,12 +42,14 @@ void run_cpu_tail_latency(
   const size_t n_lookup_total = lookup_keys.size();
   for (int b = 0; b < n_batches; ++b) {
     size_t offset = (static_cast<size_t>(b) * batch_size) % (n_lookup_total - batch_size + 1);
+    uint64_t sum = 0;
     auto t0 = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < batch_size; ++i) {
       auto it = map.find(lookup_keys[offset + i]);
-      (void)(it != map.end() ? it->second : 0xFFFFFFFFFFFFFFFFull);
+      sum += (it != map.end()) ? it->second : 0xFFFFFFFFFFFFFFFFull;
     }
     auto t1 = std::chrono::high_resolution_clock::now();
+    cpu_lookup_sink = sum;
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     out_batch_ms->push_back(ms);
   }

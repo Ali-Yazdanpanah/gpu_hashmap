@@ -56,8 +56,14 @@ inline void heuristic_set_table_size(HeuristicState* state, size_t table_bytes) 
 }
 
 /**
- * Warm-up: measure Standard Copy and Zero-Copy at 256k lookups (probe keys
- * generated internally), then set crossover_n from current PCIe/copy cost.
+ * Warm-up: measure Standard Copy and Zero-Copy at 256k lookups, then set
+ * crossover_n from current PCIe/copy cost. Probe keys are taken from the table so
+ * calibration reflects successful finds, and each path is warmed before timing and
+ * measured three times; the median is used.
+ *
+ * Note: on PCIe Gen3 hardware the measured ratio at this probe size sits near 0.9,
+ * above the 0.8 margin, so crossover_n commonly ends up SIZE_MAX (always Standard)
+ * even though Zero-Copy is faster at smaller batches. See README section 6.2.
  */
 void heuristic_warm_up(HashTable* table, HeuristicState* state,
                        cudaStream_t stream = nullptr);

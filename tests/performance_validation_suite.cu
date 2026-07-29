@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -84,6 +85,36 @@ void run_insert_lookup(gpu_hashmap::HashTable* table,
   CUDA_CHECK(cudaEventElapsedTime(out_lookup_ms, start, stop));
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
+}
+
+/**
+ * Mean chain steps for successful finds. Returned per call so the load-factor
+ * sweep can report a real curve rather than reusing one measurement.
+ */
+double measure_avg_probe_depth(gpu_hashmap::HashTable* table,
+                               gpu_hashmap::KeyType const* d_lookup_keys,
+                               gpu_hashmap::ValueType* d_lookup_out,
+                               size_t m) {
+  unsigned int* d_depth = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_depth, m * sizeof(unsigned int)));
+  gpu_hashmap::analysis::lookup_with_probe_depth<<<(m + 255) / 256, 256>>>(
+      table->d_device_table, d_lookup_keys, d_lookup_out, d_depth, m);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  std::vector<unsigned int> h_depth(m);
+  std::vector<gpu_hashmap::ValueType> h_out(m);
+  CUDA_CHECK(cudaMemcpy(h_depth.data(), d_depth, m * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_out.data(), d_lookup_out, m * sizeof(gpu_hashmap::ValueType),
+                        cudaMemcpyDeviceToHost));
+  double sum = 0;
+  size_t count = 0;
+  for (size_t i = 0; i < m; ++i) {
+    if (h_out[i] != 0xFFFFFFFFFFFFFFFFull) {
+      sum += h_depth[i];
+      ++count;
+    }
+  }
+  CUDA_CHECK(cudaFree(d_depth));
+  return count ? sum / static_cast<double>(count) : 0.0;
 }
 
 } // namespace
@@ -169,11 +200,20 @@ int main() {
   std::printf("  2a. STRESS — Zipfian (hot-key) workload\n");
   std::printf("--------------------------------------------------------------------------------\n");
   const size_t zipf_keys = 100000;
-  const size_t zipf_samples = 500000;
+  /* Bucket heads live in mapped host memory, so every CAS on a contended head is a
+   * PCIe round trip and the retry loop costs O(C^2) for C threads on one bucket.
+   * At alpha=2.0 a single key takes ~61% of the samples, so the sample count has to
+   * stay small or the standard path runs for tens of minutes. 32K keeps the worst
+   * alpha in the seconds range while still showing the contention trend. */
+  const size_t zipf_samples = 32768;
   std::vector<KeyType> zipf_k(zipf_samples), zipf_v(zipf_samples);
   for (size_t i = 0; i < zipf_samples; ++i) zipf_v[i] = i + 1000;
   double alphas[] = {0.5, 1.0, 1.5, 2.0};
-  std::printf("  %-8s  %-10s  %-10s\n", "alpha", "Insert(ms)", "Lookup(ms)");
+  /* Both insert paths are measured under the same key stream, each into its own
+   * fresh table, so the warp-aggregated column is a measurement rather than a
+   * scaled copy of the standard column. */
+  std::printf("  %-8s  %-14s  %-14s  %-10s\n",
+              "alpha", "InsStd(ms)", "InsWarp(ms)", "Lookup(ms)");
   for (double alpha : alphas) {
     ZipfianGenerator zipf(zipf_keys, alpha);
     zipf.generate(zipf_k, zipf_samples);
@@ -183,36 +223,50 @@ int main() {
     CUDA_CHECK(cudaMalloc(&vz, zipf_samples * sizeof(ValueType)));
     CUDA_CHECK(cudaMemcpy(dz, zipf_k.data(), zipf_samples * sizeof(KeyType), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(vz, zipf_v.data(), zipf_samples * sizeof(ValueType), cudaMemcpyHostToDevice));
-    HashTable tz = {};
-    hash_map_create(&tz, num_buckets, capacity);
     KeyType* dlk = nullptr;
     ValueType* dlo = nullptr;
     CUDA_CHECK(cudaMalloc(&dlk, zipf_samples * sizeof(KeyType)));
     CUDA_CHECK(cudaMalloc(&dlo, zipf_samples * sizeof(ValueType)));
     CUDA_CHECK(cudaMemcpy(dlk, zipf_k.data(), zipf_samples * sizeof(KeyType), cudaMemcpyHostToDevice));
+
     cudaEvent_t e1, e2;
     CUDA_CHECK(cudaEventCreate(&e1));
     CUDA_CHECK(cudaEventCreate(&e2));
+
+    HashTable tz = {};
+    hash_map_create(&tz, num_buckets, capacity);
     CUDA_CHECK(cudaEventRecord(e1));
     hash_map_insert_batch(&tz, dz, vz, zipf_samples);
     CUDA_CHECK(cudaEventRecord(e2));
     CUDA_CHECK(cudaEventSynchronize(e2));
     float ins_ms = 0;
     CUDA_CHECK(cudaEventElapsedTime(&ins_ms, e1, e2));
+
     CUDA_CHECK(cudaEventRecord(e1));
     lookup_kernel_impl<<<(zipf_samples + 255) / 256, 256>>>(tz.d_device_table, dlk, dlo, zipf_samples);
     CUDA_CHECK(cudaEventRecord(e2));
     CUDA_CHECK(cudaEventSynchronize(e2));
     float lup_ms = 0;
     CUDA_CHECK(cudaEventElapsedTime(&lup_ms, e1, e2));
-    std::printf("  %-8.1f  %-10.2f  %-10.2f\n", alpha, ins_ms, lup_ms);
+    hash_map_destroy(&tz);
+
+    HashTable tz_warp = {};
+    hash_map_create(&tz_warp, num_buckets, capacity);
+    CUDA_CHECK(cudaEventRecord(e1));
+    hash_map_insert_batch_warp_aggregated(&tz_warp, dz, vz, zipf_samples);
+    CUDA_CHECK(cudaEventRecord(e2));
+    CUDA_CHECK(cudaEventSynchronize(e2));
+    float ins_warp_ms = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&ins_warp_ms, e1, e2));
+    hash_map_destroy(&tz_warp);
+
+    std::printf("  %-8.1f  %-14.2f  %-14.2f  %-10.2f\n", alpha, ins_ms, ins_warp_ms, lup_ms);
     CUDA_CHECK(cudaEventDestroy(e1));
     CUDA_CHECK(cudaEventDestroy(e2));
     CUDA_CHECK(cudaFree(dz));
     CUDA_CHECK(cudaFree(vz));
     CUDA_CHECK(cudaFree(dlk));
     CUDA_CHECK(cudaFree(dlo));
-    hash_map_destroy(&tz);
   }
   std::printf("\n");
 
@@ -220,7 +274,8 @@ int main() {
   std::printf("--------------------------------------------------------------------------------\n");
   std::printf("  2b. LOAD FACTOR SWEEP (10%% to 99%%)\n");
   std::printf("--------------------------------------------------------------------------------\n");
-  std::printf("  %-10s  %-12s  %-12s  %-10s\n", "LoadFactor", "Insert(ms)", "Lookup(ms)", "Throughput");
+  std::printf("  %-10s  %-12s  %-12s  %-14s  %-10s\n",
+              "LoadFactor", "Insert(ms)", "Lookup(ms)", "Throughput", "ProbeDepth");
   for (double lf : {0.10, 0.30, 0.50, 0.70, 0.90, 0.99}) {
     size_t n_lf = static_cast<size_t>(capacity * lf);
     if (n_lf == 0) n_lf = 1;
@@ -243,7 +298,9 @@ int main() {
     float ins_lf = 0, lup_lf = 0;
     run_insert_lookup(&t_lf, dk, dv, n_lf, dl_lf, do_lf, n_lf, &ins_lf, &lup_lf);
     double throughput = (ins_lf + lup_lf) > 0 ? (n_lf * 2.0) / (ins_lf + lup_lf) * 1000.0 : 0;
-    std::printf("  %-10.0f%%  %-12.2f  %-12.2f  %-10.0f ops/s\n", lf * 100, ins_lf, lup_lf, throughput);
+    double probe_depth_lf = measure_avg_probe_depth(&t_lf, dl_lf, do_lf, n_lf);
+    std::printf("  %8.0f%%  %-12.2f  %-12.2f  %-10.0f ops/s  %-10.3f\n",
+                lf * 100, ins_lf, lup_lf, throughput, probe_depth_lf);
     CUDA_CHECK(cudaFree(dk));
     CUDA_CHECK(cudaFree(dv));
     CUDA_CHECK(cudaFree(dl_lf));
@@ -276,10 +333,41 @@ int main() {
       count_miss++;
     }
   }
+  /* The lookup batch above is drawn from inserted keys, so it can only report the
+   * successful case. Probe a batch of keys that are known to be absent to get the
+   * unsuccessful cost, which walks a whole chain before giving up. */
+  std::unordered_map<KeyType, char> present;
+  present.reserve(n_default * 2);
+  for (size_t i = 0; i < n_default; ++i) present[h_keys[i]] = 1;
+  std::vector<KeyType> h_absent(m_lookup);
+  std::mt19937_64 absent_rng(0xBADC0FFEull);
+  for (size_t i = 0; i < m_lookup; ++i) {
+    KeyType cand;
+    do {
+      cand = absent_rng();
+    } while (cand == 0 || present.find(cand) != present.end());
+    h_absent[i] = cand;
+  }
+  KeyType* d_absent = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_absent, m_lookup * sizeof(KeyType)));
+  CUDA_CHECK(cudaMemcpy(d_absent, h_absent.data(), m_lookup * sizeof(KeyType),
+                        cudaMemcpyHostToDevice));
+  analysis::lookup_with_probe_depth<<<(m_lookup + 255) / 256, 256>>>(
+      table.d_device_table, d_absent, d_lookup_out, d_depth, m_lookup);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaMemcpy(h_depth.data(), d_depth, m_lookup * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_out.data(), d_lookup_out, m_lookup * sizeof(ValueType), cudaMemcpyDeviceToHost));
+  for (size_t i = 0; i < m_lookup; ++i) {
+    if (h_out[i] == 0xFFFFFFFFFFFFFFFFull) {
+      sum_miss += h_depth[i];
+      count_miss++;
+    }
+  }
   std::printf("  Successful find — avg probe depth: %.3f (count %d)\n",
               count_hit > 0 ? sum_hit / count_hit : 0, count_hit);
   std::printf("  Unsuccessful find — avg probe depth: %.3f (count %d)\n\n",
               count_miss > 0 ? sum_miss / count_miss : 0, count_miss);
+  CUDA_CHECK(cudaFree(d_absent));
   CUDA_CHECK(cudaFree(d_depth));
 
   // ---------- 2d. Sparsity-Driven Crossover (massive table + N=10,000) ----------

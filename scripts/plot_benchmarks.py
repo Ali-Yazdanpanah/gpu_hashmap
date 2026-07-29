@@ -92,50 +92,59 @@ def run_benchmark(build_dir: Path, exe: str, timeout_s: int = 300) -> str:
 
 
 def parse_heuristic(stdout: str) -> dict:
-    """Parse benchmark_heuristic: warm-up line + sweep table + sparsity-driven crossover block."""
-    data = {"batch_sizes_k": [64, 128, 256, 384, 512], "safety_margin_alpha": 0.8}
-    # Warm-up: [heuristic] warm-up: Standard_Total=X.XX ms, ZeroCopy_Total=X.XX ms ... -> crossover_n=XXXXX
-    m = re.search(
-        r"\[heuristic\] warm-up: Standard_Total=([\d.]+) ms, ZeroCopy_Total=([\d.]+) ms.*?crossover_n=(\d+)",
-        stdout,
-        re.DOTALL,
-    )
-    if m:
-        std_256 = float(m.group(1))
-        zc_256 = float(m.group(2))
-        data["crossover_n"] = int(m.group(3))
-        # Linear scaling: T(N) = T_256 * (N/262144)
-        n_k = np.array(data["batch_sizes_k"])
-        data["standard_path_ms"] = (std_256 * (n_k / 256.0)).tolist()
-        data["zerocopy_path_ms"] = (zc_256 * (n_k / 256.0)).tolist()
-    else:
-        data["crossover_n"] = 256
-        data["standard_path_ms"] = [2.1, 3.8, 6.2, 8.9, 11.5]
-        data["zerocopy_path_ms"] = [1.4, 2.1, 3.2, 4.1, 5.0]
+    """Parse benchmark_heuristic: warm-up line, per-N sweep of BOTH paths, sparsity block.
 
-    # Sparsity-Driven Crossover (massive table + N=10K): Standard (full table copy) vs Zero-Copy
-    std_full = re.search(r"Standard path \(full table copy \+ lookup\):\s+([\d.]+)\s+ms", stdout)
+    Every batch size in the sweep is measured on both paths, so nothing here is
+    extrapolated. If the sweep table cannot be parsed, the caller is told (by the
+    absence of the keys) rather than being handed synthetic numbers.
+    """
+    data = {"safety_margin_alpha": 0.8}
+
+    m = re.search(r"crossover_n=(\d+)", stdout)
+    if m:
+        data["crossover_n"] = int(m.group(1))
+
+    # Sweep rows: "  16384         0.412           0.398           Standard        0.97"
+    rows = re.findall(
+        r"^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s+(Standard|Zero-Copy)\s+([\d.]+)\s*$",
+        stdout,
+        re.MULTILINE,
+    )
+    if rows:
+        rows.sort(key=lambda r: int(r[0]))
+        data["batch_sizes_n"] = [int(r[0]) for r in rows]
+        data["batch_sizes_k"] = [int(r[0]) / 1024.0 for r in rows]
+        data["standard_path_ms"] = [float(r[1]) for r in rows]
+        data["zerocopy_path_ms"] = [float(r[2]) for r in rows]
+        data["chosen_path"] = [r[3] for r in rows]
+
+    # Sparsity block: live-data migration, naive full-capacity migration, zero-copy
+    std_live = re.search(r"Standard path \(live-data copy \+ lookup\):\s+([\d.]+)\s+ms", stdout)
+    naive_full = re.search(r"Naive full-capacity migration only:\s+([\d.]+)\s+ms", stdout)
     zc_nomig = re.search(r"Zero-Copy path \(no table migration\):\s+([\d.]+)\s+ms", stdout)
-    if std_full and zc_nomig:
+    if std_live and zc_nomig:
         data["sparsity_n_k"] = 10  # 10K lookups
-        data["sparsity_standard_ms"] = float(std_full.group(1))
+        data["sparsity_standard_ms"] = float(std_live.group(1))
         data["sparsity_zerocopy_ms"] = float(zc_nomig.group(1))
+    if naive_full:
+        data["sparsity_naive_full_migration_ms"] = float(naive_full.group(1))
     return data
 
 
 def parse_vs_cpu(stdout: str) -> dict:
     """Parse benchmark_vs_cpu: all 5 rows (CPU, GPU chained, warp-agg, slab, Hybrid). Insert(ms), Lookup(ms), Total(ms), vs CPU.
     Also parses CPU per-find latency (µs): P50, P90, P99 for Figure 6."""
-    # Display names for plot (order must match benchmark output)
-    approach_names = [
-        "CPU (unordered_map)",
-        "GPU Chained",
-        "GPU Warp-agg",
-        "GPU Slab",
-        "Hybrid (CPU+GPU lup)",
-    ]
+    # Short display label per benchmark row label, so the plot legend cannot
+    # silently desync from what the benchmark actually printed.
+    display_names = {
+        "cpu (unordered_map)": "CPU (unordered_map)",
+        "gpu chained": "GPU Chained",
+        "gpu warp-aggregated": "GPU Warp-agg",
+        "gpu slab (8/bucket)": "GPU Slab",
+        "hybrid (cpu+gpu lup)": "Hybrid (CPU+GPU lup)",
+    }
     data = {
-        "approaches": approach_names,
+        "approaches": [],
         "insert_ms": [],
         "lookup_ms": [],
         "total_ms": [],
@@ -143,7 +152,6 @@ def parse_vs_cpu(stdout: str) -> dict:
         "total_ops": 1536000,
         "cpu_per_find_us": None,
     }
-    # Match all 5 rows: CPU, GPU chained, GPU warp-aggregated, GPU slab (8/bucket), Hybrid (CPU+GPU lup); capture Total(ms) and vs CPU (speedup)
     pattern = re.compile(
         r"^\s*(CPU \(unordered_map\)|GPU chained|GPU warp-aggregated|GPU slab \(8/bucket\)|Hybrid \(CPU\+GPU lup\))\s+"
         r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)x",
@@ -152,15 +160,12 @@ def parse_vs_cpu(stdout: str) -> dict:
     for line in stdout.splitlines():
         m = pattern.match(line)
         if m:
+            label = m.group(1).strip().lower()
+            data["approaches"].append(display_names.get(label, m.group(1).strip()))
             data["insert_ms"].append(float(m.group(2)))
             data["lookup_ms"].append(float(m.group(3)))
             data["total_ms"].append(float(m.group(4)))
             data["speedup_x"].append(float(m.group(5)))
-    if len(data["insert_ms"]) != 5:
-        data["insert_ms"] = [420.0, 85.0, 75.0, 12.0, 42.0]
-        data["lookup_ms"] = [180.0, 8.2, 7.8, 2.1, 31.0]
-        data["total_ms"] = [600.0, 410.0, 358.0, 1.6, 42.0]
-        data["speedup_x"] = [1.0, 0.18, 0.21, 46.92, 1.78]
     # CPU per-find latency (µs): "  CPU per-find latency (µs):  P50=    1.23   P90=    2.34   P99=    4.56"
     cpu_lat = re.search(
         r"CPU per-find latency \(µs\):\s+P50=\s+([\d.]+)\s+P90=\s+([\d.]+)\s+P99=\s+([\d.]+)",
@@ -183,43 +188,57 @@ def parse_validation_suite(stdout: str) -> dict:
         "probe_depth_success": None,
         "roofline": None,
     }
-    # 2a Zipfian: "  0.5       45.20      12.30" (alpha, Insert(ms), Lookup(ms))
-    zipf_alphas, zipf_ins, zipf_lup = [], [], []
+    # 2a Zipfian: "  0.5   45.20   38.10   12.30" (alpha, InsStd, InsWarp, Lookup)
+    zipf_alphas, zipf_ins, zipf_warp, zipf_lup = [], [], [], []
     for line in stdout.splitlines():
-        m = re.match(r"^\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*$", line.strip())
+        m = re.match(r"^\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*$", line.strip())
         if m:
             try:
                 a = float(m.group(1))
                 if 0.4 <= a <= 2.1:
                     zipf_alphas.append(a)
                     zipf_ins.append(float(m.group(2)))
-                    zipf_lup.append(float(m.group(3)))
+                    zipf_warp.append(float(m.group(3)))
+                    zipf_lup.append(float(m.group(4)))
             except ValueError:
                 pass
     if zipf_alphas:
-        result["zipfian"] = {"alphas": zipf_alphas, "standard_insert_ms": zipf_ins, "lookup_ms": zipf_lup}
+        result["zipfian"] = {
+            "alphas": zipf_alphas,
+            "standard_insert_ms": zipf_ins,
+            "warp_agg_insert_ms": zipf_warp,
+            "lookup_ms": zipf_lup,
+        }
 
-    # 2b Load factor: "  10%  8.10  2.10  185000 ops/s"
-    lf_pct, lf_ins, lf_lup, lf_throughput = [], [], [], []
+    # 2b Load factor: "  10%  8.10  2.10  185000 ops/s  1.350"
+    lf_pct, lf_ins, lf_lup, lf_throughput, lf_probe = [], [], [], [], []
     for line in stdout.splitlines():
-        m = re.match(r"^\s*(\d+)%\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+ops/s", line.strip())
+        m = re.match(
+            r"^\s*(\d+)\s*%\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+ops/s\s+([\d.]+)\s*$",
+            line.strip(),
+        )
         if m:
             lf_pct.append(int(m.group(1)))
             lf_ins.append(float(m.group(2)))
             lf_lup.append(float(m.group(3)))
             lf_throughput.append(float(m.group(4)))
+            lf_probe.append(float(m.group(5)))
     if lf_pct:
         result["load_factor"] = {
             "load_factor_pct": lf_pct,
             "insert_ms": lf_ins,
             "lookup_ms": lf_lup,
             "throughput_ops_per_sec": lf_throughput,
+            "avg_probe_depth": lf_probe,
         }
 
     # 2c Probe depth: "  Successful find — avg probe depth: 1.234 (count ...)"
     m = re.search(r"Successful find — avg probe depth: ([\d.]+)", stdout)
     if m:
         result["probe_depth_success"] = float(m.group(1))
+    m = re.search(r"Unsuccessful find — avg probe depth: ([\d.]+) \(count (\d+)\)", stdout)
+    if m and int(m.group(2)) > 0:
+        result["probe_depth_unsuccessful"] = float(m.group(1))
 
     # Section 4: "  Insert (effective)             4.20       16.00      26.2%"
     ins_bw = re.search(r"Insert \(effective\)\s+([\d.]+)\s+[\d.]+\s+", stdout)
@@ -232,20 +251,6 @@ def parse_validation_suite(stdout: str) -> dict:
             "peak_gen4_gbps": 32,
         }
     return result
-
-
-def parse_zerocopy(stdout: str) -> dict:
-    """Parse benchmark_zerocopy: Copy+Kernel total and Zero-copy kernel-only (one N)."""
-    data = {}
-    # "    Total:        X.XXX ms" (Copy+Kernel)
-    m = re.search(r"Total:\s+([\d.]+)\s+ms", stdout)
-    if m:
-        data["standard_total_ms"] = float(m.group(1))
-    # "    Zero-copy kernel-only:     X.XXX ms"
-    m = re.search(r"Zero-copy kernel-only:\s+([\d.]+)\s+ms", stdout)
-    if m:
-        data["zerocopy_kernel_ms"] = float(m.group(1))
-    return data
 
 
 def parse_tail_latency(stdout: str) -> dict:
@@ -288,147 +293,117 @@ def parse_occupancy(stdout: str) -> dict:
 
 
 def run_and_parse_all(build_dir: Path) -> dict:
-    """Run all benchmarks, parse stdout, return merged data dict for plotting."""
-    build_dir = Path(build_dir).resolve()
-    default_data = {
-        "interconnect": {
-            "batch_sizes_k": [64, 128, 256, 384, 512],
-            "standard_path_ms": [2.1, 3.8, 6.2, 8.9, 11.5],
-            "zerocopy_path_ms": [1.4, 2.1, 3.2, 4.1, 5.0],
-            "crossover_n": 256,
-            "safety_margin_alpha": 0.8,
-        },
-        "warp_aggregation": {
-            "alphas": [0.5, 1.0, 1.5, 2.0],
-            "standard_insert_ms": [45.2, 52.1, 68.3, 89.4],
-            "warp_agg_insert_ms": [38.1, 41.2, 48.5, 55.2],
-        },
-        "heterogeneous": {
-            "approaches": ["CPU (unordered_map)", "GPU Chained", "GPU Warp-agg", "GPU Slab", "Hybrid (CPU+GPU lup)"],
-            "insert_ms": [420.0, 85.0, 75.0, 12.0, 42.0],
-            "lookup_ms": [180.0, 8.2, 7.8, 2.1, 31.0],
-            "total_ms": [600.0, 410.0, 358.0, 1.6, 42.0],
-            "speedup_x": [1.0, 0.18, 0.21, 46.92, 1.78],
-            "total_ops": 1536000,
-        },
-        "load_factor": {
-            "load_factor_pct": [10, 30, 50, 70, 90, 99],
-            "insert_ms": [8.1, 22.3, 38.5, 52.1, 65.2, 72.1],
-            "lookup_ms": [2.1, 3.2, 4.5, 5.8, 7.1, 8.2],
-            "throughput_ops_per_sec": [185000, 142000, 116000, 92000, 78000, 62000],
-            "avg_probe_depth": [1.05, 1.18, 1.35, 1.62, 2.11, 3.45],
-        },
-        "roofline": {
-            "operations": ["Insert", "Lookup"],
-            "achieved_gbps": [4.2, 8.5],
-            "peak_gen3_gbps": 16,
-            "peak_gen4_gbps": 32,
-        },
-        "tail_latency": {
-            "gpu": {"p50_ms": 0.08, "p90_ms": 0.12, "p99_ms": 0.25},
-            "gpu_slab": {"p50_ms": 0.05, "p90_ms": 0.09, "p99_ms": 0.18},
-            "cpu": {"p50_ms": 2.1, "p90_ms": 3.5, "p99_ms": 5.2},
-            "cpu_per_find_us": {"p50_us": 0.8, "p90_us": 1.5, "p99_us": 3.2},
-        },
-        "occupancy": {
-            "block_sizes": [32, 64, 128, 256, 512, 1024],
-            "occupancy": [0.25, 0.5, 0.75, 1.0, 0.75, 0.5],
-            "throughput_mops": [35.2, 68.1, 95.3, 112.0, 98.5, 72.1],
-        },
-    }
+    """Run all benchmarks, parse stdout, return merged data dict for plotting.
 
-    # benchmark_heuristic
+    Every value returned comes from a benchmark run. When a benchmark fails or its
+    output cannot be parsed, the corresponding key is left absent and a warning is
+    printed; the affected figure is then skipped. Nothing is filled in with
+    placeholder or extrapolated numbers.
+    """
+    build_dir = Path(build_dir).resolve()
+    data: dict = {}
+    failures: list = []
+
+    # benchmark_heuristic -> fig1
     try:
         out = run_benchmark(build_dir, "benchmark_heuristic")
-        default_data["interconnect"] = parse_heuristic(out)
-        print("Parsed benchmark_heuristic")
+        parsed = parse_heuristic(out)
+        if "standard_path_ms" in parsed:
+            data["interconnect"] = parsed
+            print("Parsed benchmark_heuristic")
+        else:
+            failures.append("benchmark_heuristic: ran, but the sweep table did not parse")
     except Exception as e:
-        print(f"benchmark_heuristic: {e}", file=sys.stderr)
+        failures.append(f"benchmark_heuristic: {e}")
 
-    # benchmark_vs_cpu (heterogeneous + CPU per-find latency for fig6)
+    # benchmark_vs_cpu -> fig3, fig8, fig9 (+ CPU per-find latency for fig6)
     cpu_per_find_us_from_vs_cpu = None
     try:
         out = run_benchmark(build_dir, "benchmark_vs_cpu")
         vs_cpu = parse_vs_cpu(out)
-        default_data["heterogeneous"] = {k: v for k, v in vs_cpu.items() if k != "cpu_per_find_us"}
+        if vs_cpu.get("insert_ms"):
+            data["heterogeneous"] = {k: v for k, v in vs_cpu.items() if k != "cpu_per_find_us"}
+            print("Parsed benchmark_vs_cpu")
+        else:
+            failures.append("benchmark_vs_cpu: ran, but the comparison table did not parse")
         if vs_cpu.get("cpu_per_find_us"):
             cpu_per_find_us_from_vs_cpu = vs_cpu["cpu_per_find_us"]
-        print("Parsed benchmark_vs_cpu")
     except Exception as e:
-        print(f"benchmark_vs_cpu: {e}", file=sys.stderr)
+        failures.append(f"benchmark_vs_cpu: {e}")
 
-    # performance_validation_suite (Zipfian, load factor, probe depth, roofline) – can be slow
+    # performance_validation_suite -> fig2, fig4, fig5 (slow)
     try:
-        out = run_benchmark(build_dir, "performance_validation_suite", timeout_s=1200)
+        out = run_benchmark(build_dir, "performance_validation_suite", timeout_s=1800)
         vs = parse_validation_suite(out)
-        if vs["zipfian"]:
-            default_data["warp_aggregation"] = {
+        if vs["zipfian"] and vs["zipfian"].get("warp_agg_insert_ms"):
+            data["warp_aggregation"] = {
                 "alphas": vs["zipfian"]["alphas"],
                 "standard_insert_ms": vs["zipfian"]["standard_insert_ms"],
-                # Warp-agg not in suite; use ~85% of standard as placeholder
-                "warp_agg_insert_ms": [t * 0.85 for t in vs["zipfian"]["standard_insert_ms"]],
+                "warp_agg_insert_ms": vs["zipfian"]["warp_agg_insert_ms"],
             }
-        if vs["load_factor"]:
-            lf = vs["load_factor"]
-            default_data["load_factor"] = {
-                "load_factor_pct": lf["load_factor_pct"],
-                "insert_ms": lf["insert_ms"],
-                "lookup_ms": lf["lookup_ms"],
-                "throughput_ops_per_sec": lf["throughput_ops_per_sec"],
-                "avg_probe_depth": [vs["probe_depth_success"]] * len(lf["load_factor_pct"])
-                if vs["probe_depth_success"] is not None
-                else [1.5] * len(lf["load_factor_pct"]),
-            }
+        else:
+            failures.append("performance_validation_suite: Zipfian table did not parse")
+        if vs["load_factor"] and vs["load_factor"].get("avg_probe_depth"):
+            data["load_factor"] = vs["load_factor"]
+        else:
+            failures.append("performance_validation_suite: load-factor table did not parse")
         if vs["roofline"]:
-            default_data["roofline"] = vs["roofline"]
+            data["roofline"] = vs["roofline"]
+        else:
+            failures.append("performance_validation_suite: roofline section did not parse")
+        for k in ("probe_depth_success", "probe_depth_unsuccessful"):
+            if vs.get(k) is not None:
+                data[k] = vs[k]
         print("Parsed performance_validation_suite")
     except Exception as e:
-        print(f"performance_validation_suite: {e}", file=sys.stderr)
+        failures.append(f"performance_validation_suite: {e}")
 
-    # benchmark_zerocopy: can override roofline if validation_suite didn't run
-    try:
-        out = run_benchmark(build_dir, "benchmark_zerocopy")
-        zc = parse_zerocopy(out)
-        if zc and "roofline" in default_data and "achieved_gbps" in default_data["roofline"]:
-            # Zerocopy gives lookup kernel time at 256K; BW = 8.39 / T_ms GB/s
-            if "zerocopy_kernel_ms" in zc:
-                lookup_gbps = 8.39 / (zc["zerocopy_kernel_ms"] or 0.001)
-                default_data["roofline"]["achieved_gbps"][1] = round(lookup_gbps, 2)
-        print("Parsed benchmark_zerocopy")
-    except Exception as e:
-        print(f"benchmark_zerocopy: {e}", file=sys.stderr)
-
-    # benchmark_tail_latency (GPU Chained, GPU Slab, CPU batch percentiles; merge CPU per-find µs from vs_cpu)
+    # benchmark_tail_latency -> fig6
     try:
         out = run_benchmark(build_dir, "benchmark_tail_latency")
-        default_data["tail_latency"] = parse_tail_latency(out)
+        tl = parse_tail_latency(out)
         if cpu_per_find_us_from_vs_cpu:
-            default_data["tail_latency"]["cpu_per_find_us"] = cpu_per_find_us_from_vs_cpu
+            tl["cpu_per_find_us"] = cpu_per_find_us_from_vs_cpu
+        data["tail_latency"] = tl
         print("Parsed benchmark_tail_latency")
     except Exception as e:
-        print(f"benchmark_tail_latency: {e}", file=sys.stderr)
+        failures.append(f"benchmark_tail_latency: {e}")
 
-    # benchmark_occupancy
+    # benchmark_occupancy -> fig7
     try:
         out = run_benchmark(build_dir, "benchmark_occupancy")
-        default_data["occupancy"] = parse_occupancy(out)
-        print("Parsed benchmark_occupancy")
+        occ = parse_occupancy(out)
+        if occ.get("block_sizes"):
+            data["occupancy"] = occ
+            print("Parsed benchmark_occupancy")
+        else:
+            failures.append("benchmark_occupancy: ran, but no throughput rows parsed")
     except Exception as e:
-        print(f"benchmark_occupancy: {e}", file=sys.stderr)
+        failures.append(f"benchmark_occupancy: {e}")
 
-    return default_data
+    if failures:
+        print("\n!! Some data is missing; the affected figures will be SKIPPED, not faked:",
+              file=sys.stderr)
+        for f in failures:
+            print(f"   - {f}", file=sys.stderr)
+        print("", file=sys.stderr)
+
+    return data
 
 
 # -----------------------------------------------------------------------------
 # 1. Interconnect Latency vs. Batch Size (Crossover + Safety Margin)
 # -----------------------------------------------------------------------------
 def plot_interconnect_crossover(data: dict, outdir: Path) -> None:
-    d = data["interconnect"]
+    d = data.get("interconnect") or {}
+    if not d.get("batch_sizes_k") or not d.get("standard_path_ms"):
+        print("Skipping fig1 (no measured interconnect sweep data)")
+        return
     n_k = np.array(d["batch_sizes_k"], dtype=float)
     t_std = np.array(d["standard_path_ms"])
     t_zc = np.array(d["zerocopy_path_ms"])
     # crossover_n: from benchmark = actual N (e.g. 262144); from JSON/sample may be in K (e.g. 256)
-    crossover_n_raw = d["crossover_n"]
+    crossover_n_raw = d.get("crossover_n", 0)
     size_max = 1 << 64  # heuristic uses SIZE_MAX when no crossover
     if crossover_n_raw >= size_max - 1 or crossover_n_raw <= 0:
         crossover_n_k = None
@@ -437,7 +412,7 @@ def plot_interconnect_crossover(data: dict, outdir: Path) -> None:
     else:
         crossover_n_k = crossover_n_raw / 1024.0  # convert actual N to thousands
 
-    alpha = d["safety_margin_alpha"]
+    alpha = d.get("safety_margin_alpha", 0.8)
 
     # Full-page size so the chart is not condensed (x-axis has room for 10K–512K)
     fig, ax = plt.subplots(figsize=(12.0, 7.0))
@@ -455,13 +430,13 @@ def plot_interconnect_crossover(data: dict, outdir: Path) -> None:
     sparsity_std = d.get("sparsity_standard_ms")
     sparsity_zc = d.get("sparsity_zerocopy_ms")
     if sparsity_n is not None and sparsity_std is not None and sparsity_zc is not None:
-        x_std, x_zc = sparsity_n - 0.5, sparsity_n + 0.5
+        x_std, x_zc = sparsity_n * 0.93, sparsity_n * 1.07
         ax.plot(x_std, sparsity_std, "*", color="C0", markersize=16, markeredgecolor="black", markeredgewidth=1.2,
                 zorder=5, label="Standard (2GB table copy + 10K lookup)")
         ax.plot(x_zc, sparsity_zc, "D", color="C1", markersize=10, markeredgecolor="black", markeredgewidth=1.2,
                 zorder=5, label="Zero-Copy (no table migration, 10K lookup)")
         ax.annotate("Sparsity:\nZero-Copy bypasses\ntable migration tax",
-                    xy=(x_zc, sparsity_zc), xytext=(sparsity_n + 55, (sparsity_std + sparsity_zc) / 2),
+                    xy=(x_zc, sparsity_zc), xytext=(sparsity_n * 1.8, (sparsity_std + sparsity_zc) / 2),
                     fontsize=8, ha="left", va="center",
                     arrowprops=dict(arrowstyle="->", color="gray", lw=1))
         if sparsity_zc < sparsity_std * 0.1:  # call out the low point so it's visible
@@ -470,27 +445,30 @@ def plot_interconnect_crossover(data: dict, outdir: Path) -> None:
     # Only draw crossover line when it's within the plotted batch-size range (crossover_n is in actual N, so convert to K)
     x_min, x_max = float(np.min(n_k)), float(np.max(n_k))
     if sparsity_n is not None:
-        x_min = min(x_min, float(sparsity_n) - 0.5)  # sparsity points at 9.5 and 10.5
+        x_min = min(x_min, float(sparsity_n) * 0.93)
+    # The two curves do not intersect on this machine, so this line is where the
+    # heuristic switches paths, not a point where the faster path changes.
     if crossover_n_k is not None and x_min <= crossover_n_k <= x_max:
-        ax.axvline(x=crossover_n_k, color="gray", linestyle="--", linewidth=1.5, label=f"Crossover N ≈ {int(round(crossover_n_k))}K")
+        ax.axvline(x=crossover_n_k, color="gray", linestyle="--", linewidth=1.5,
+                   label=f"Heuristic switches to Zero-Copy (N ≈ {int(round(crossover_n_k))}K)")
 
-    ax.set_xlabel("Batch size (thousands of lookups)")
+    ax.set_xlabel("Batch size (thousands of lookups, log scale)")
     ax.set_ylabel("End-to-end latency (ms)")
     ax.set_title("Interconnect: Standard vs Zero-Copy Path")
-    ax.set_xlim(x_min - (x_max - x_min) * 0.05, x_max + (x_max - x_min) * 0.05)
-    # Ensure bottom y-margin when sparsity point is very low so it and the "10K (sparse)" label don't overlap
-    if sparsity_zc is not None:
-        y_lo, y_hi = ax.get_ylim()
-        if sparsity_zc < y_lo + (y_hi - y_lo) * 0.12:
-            ax.set_ylim(bottom=max(0, sparsity_zc - (y_hi - y_lo) * 0.06))
+    # Batch sizes double each step, so a linear axis crushes every small-N point into
+    # the left edge and the tick labels overlap.
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.set_xlim(x_min * 0.85, x_max * 1.18)
     xticks = list(n_k)
     xtick_labels = [f"{int(x)}K" for x in n_k]
     if sparsity_n is not None and sparsity_n not in xticks:
-        xticks.append(sparsity_n)
+        xticks.append(float(sparsity_n))
         xticks.sort()
         xtick_labels = [f"{int(x)}K" if x != sparsity_n else "10K\n(sparse)" for x in xticks]
     ax.set_xticks(xticks)
     ax.set_xticklabels(xtick_labels)
+    ax.minorticks_off()
     # Legend outside chart (right) so it never hides data
     ax.legend(loc="upper left", fontsize=9, bbox_to_anchor=(1.02, 1), frameon=True)
     fig.tight_layout(rect=[0, 0, 0.78, 1])
@@ -503,7 +481,10 @@ def plot_interconnect_crossover(data: dict, outdir: Path) -> None:
 # 2. Warp-Aggregation Efficiency (Zipfian skew)
 # -----------------------------------------------------------------------------
 def plot_warp_aggregation(data: dict, outdir: Path) -> None:
-    d = data["warp_aggregation"]
+    d = data.get("warp_aggregation") or {}
+    if not d.get("alphas") or not d.get("warp_agg_insert_ms"):
+        print("Skipping fig2 (no measured warp-aggregation data)")
+        return
     alphas = np.array(d["alphas"])
     std_ms = np.array(d["standard_insert_ms"])
     warp_ms = np.array(d["warp_agg_insert_ms"])
@@ -515,12 +496,19 @@ def plot_warp_aggregation(data: dict, outdir: Path) -> None:
     bars1 = ax.bar(x - width / 2, std_ms, width, label="Standard insert_kernel", color="C0", edgecolor="black", linewidth=0.5)
     bars2 = ax.bar(x + width / 2, warp_ms, width, label="Warp-aggregated insert", color="C1", edgecolor="black", linewidth=0.5)
 
+    # Insert time spans three orders of magnitude across these skews, so a linear
+    # axis flattens the low-skew bars into the baseline.
+    ax.set_yscale("log")
     ax.set_xlabel("Zipfian skew α")
-    ax.set_ylabel("Insert time (ms)")
+    ax.set_ylabel("Insert time (ms, log scale)")
     ax.set_title("Warp-aggregation efficiency under hot-key contention")
     ax.set_xticks(x)
     ax.set_xticklabels([str(a) for a in alphas])
-    ax.legend()
+    for xi, s, w in zip(x, std_ms, warp_ms):
+        if w > 0:
+            ax.annotate(f"{s / w:.1f}x", xy=(xi, max(s, w)), xytext=(0, 5),
+                        textcoords="offset points", ha="center", fontsize=9)
+    ax.legend(loc="upper left")
     fig.savefig(outdir / "fig2_warp_aggregation_zipfian.png")
     plt.close(fig)
     print("Saved fig2_warp_aggregation_zipfian.png")
@@ -530,13 +518,17 @@ def plot_warp_aggregation(data: dict, outdir: Path) -> None:
 # 3. Heterogeneous Speedup (CPU vs Chained vs Slab)
 # -----------------------------------------------------------------------------
 def plot_heterogeneous_speedup(data: dict, outdir: Path) -> None:
-    d = data["heterogeneous"]
-    approaches = d["approaches"]
+    d = data.get("heterogeneous") or {}
+    approaches = d.get("approaches") or []
+    if not approaches:
+        print("Skipping fig3 (no heterogeneous data)")
+        return
     insert_ms = np.array(d["insert_ms"])
     lookup_ms = np.array(d["lookup_ms"])
     total_ops = d["total_ops"]
     total_ms = insert_ms + lookup_ms
-    ops_per_sec = (total_ops / 1000.0) / (total_ms / 1000.0)  # ops/sec
+    # total_ms is in milliseconds, so seconds = total_ms / 1000.
+    ops_per_sec = total_ops / (total_ms / 1000.0)
 
     n = len(approaches)
     x = np.arange(n)
@@ -551,7 +543,9 @@ def plot_heterogeneous_speedup(data: dict, outdir: Path) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(approaches, rotation=20, ha="right")
     for i, (bar, v) in enumerate(zip(bars, ops_per_sec)):
-        if v >= 1e6:
+        if v >= 1e9:
+            label = f"{v/1e9:.2f}G"
+        elif v >= 1e6:
             label = f"{v/1e6:.2f}M"
         elif v >= 1e3:
             label = f"{v/1e3:.1f}K"
@@ -619,10 +613,53 @@ def plot_timings_and_speedup(data: dict, outdir: Path) -> None:
 
 
 # -----------------------------------------------------------------------------
+# 9. Insert and Lookup time by approach (log scale)
+# -----------------------------------------------------------------------------
+def plot_timings_by_approach(data: dict, outdir: Path) -> None:
+    d = data.get("heterogeneous") or {}
+    approaches = d.get("approaches") or []
+    insert_ms = np.array(d.get("insert_ms") or [], dtype=float)
+    lookup_ms = np.array(d.get("lookup_ms") or [], dtype=float)
+    if not approaches or len(insert_ms) != len(approaches) or len(lookup_ms) != len(approaches):
+        print("Skipping fig9 (no heterogeneous timing data)")
+        return
+    n = len(approaches)
+    x = np.arange(n)
+    width = 0.38
+
+    fig, ax = plt.subplots(figsize=(max(FIGW, n * 1.3), FIGH))
+    ax.bar(x - width / 2, insert_ms, width, label="Insert (ms)",
+           color="C0", edgecolor="black", linewidth=0.5)
+    ax.bar(x + width / 2, lookup_ms, width, label="Lookup (ms)",
+           color="C1", edgecolor="black", linewidth=0.5)
+    # Log scale so sub-millisecond and hundreds-of-milliseconds bars are both readable.
+    ax.set_yscale("log")
+    ax.set_ylabel("Time (ms, log scale)")
+    ax.set_xlabel("Implementation")
+    ax.set_title("Insert and lookup time by approach")
+    ax.set_xticks(x)
+    ax.set_xticklabels(approaches, rotation=20, ha="right")
+    ax.legend()
+    for xi, v in zip(x - width / 2, insert_ms):
+        if v > 0:
+            ax.text(xi, v * 1.1, f"{v:.2f}", ha="center", va="bottom", fontsize=8)
+    for xi, v in zip(x + width / 2, lookup_ms):
+        if v > 0:
+            ax.text(xi, v * 1.1, f"{v:.2f}", ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(outdir / "fig9_timings_by_approach.png", bbox_inches="tight", dpi=DPI)
+    plt.close(fig)
+    print("Saved fig9_timings_by_approach.png")
+
+
+# -----------------------------------------------------------------------------
 # 4. VRAM Occupancy vs Throughput (dual-axis with Probe Depth)
 # -----------------------------------------------------------------------------
 def plot_load_factor_throughput(data: dict, outdir: Path) -> None:
-    d = data["load_factor"]
+    d = data.get("load_factor") or {}
+    if not d.get("load_factor_pct") or not d.get("avg_probe_depth"):
+        print("Skipping fig4 (no measured load-factor / probe-depth data)")
+        return
     lf = np.array(d["load_factor_pct"])
     throughput = np.array(d["throughput_ops_per_sec"])
     probe_depth = np.array(d["avg_probe_depth"])
@@ -639,7 +676,7 @@ def plot_load_factor_throughput(data: dict, outdir: Path) -> None:
     ax2.tick_params(axis="y", labelcolor=color2)
     ax2.plot(lf, probe_depth, "s--", color=color2, linewidth=2, markersize=8)
 
-    ax1.set_title("VRAM occupancy: Throughput and probe depth vs load factor")
+    ax1.set_title("Chained table: throughput and probe depth vs load factor")
     ax1.set_xticks(lf)
     fig.tight_layout()
     fig.savefig(outdir / "fig4_load_factor_throughput_probe_depth.png")
@@ -651,7 +688,10 @@ def plot_load_factor_throughput(data: dict, outdir: Path) -> None:
 # 5. PCIe Roofline Model
 # -----------------------------------------------------------------------------
 def plot_roofline(data: dict, outdir: Path) -> None:
-    d = data["roofline"]
+    d = data.get("roofline") or {}
+    if not d.get("operations") or not d.get("achieved_gbps"):
+        print("Skipping fig5 (no measured roofline data)")
+        return
     ops = d["operations"]
     achieved = np.array(d["achieved_gbps"])
     peak_gen3 = d["peak_gen3_gbps"]
@@ -669,14 +709,18 @@ def plot_roofline(data: dict, outdir: Path) -> None:
     colors = ["C0", "C1"]
     for i, (op, gbps) in enumerate(zip(ops, achieved)):
         ax.bar(i, gbps, width=0.4, color=colors[i], edgecolor="black", linewidth=0.5)
-        ax.text(i, gbps + 0.5, f"{gbps:.1f}", ha="center", va="bottom", fontsize=10)
+        ax.text(i, gbps * 1.15, f"{gbps:.2f} GB/s\n({100.0 * gbps / peak_gen3:.1f}% of Gen3)",
+                ha="center", va="bottom", fontsize=9)
 
-    ax.set_ylabel("Effective bandwidth (GB/s)")
+    ax.set_ylabel("Effective bandwidth (GB/s, log scale)")
     ax.set_xlabel("Operation")
     ax.set_title("PCIe roofline: Achieved vs theoretical peak bandwidth")
     ax.set_xticks(x)
     ax.set_xticklabels(ops)
-    ax.set_ylim(0, max(peak_gen4 * 1.1, max(achieved) * 1.5))
+    # Achieved bandwidth is ~100x below the interconnect ceiling, so on a linear axis
+    # the measured bars are not visible at all.
+    ax.set_yscale("log")
+    ax.set_ylim(min(achieved) * 0.3, peak_gen4 * 3.0)
     ax.legend(loc="upper right")
     fig.savefig(outdir / "fig5_pcie_roofline.png")
     plt.close(fig)
@@ -688,13 +732,15 @@ def plot_roofline(data: dict, outdir: Path) -> None:
 # -----------------------------------------------------------------------------
 def plot_tail_latency(data: dict, outdir: Path) -> None:
     tl = data.get("tail_latency") or {}
-    cpu_us = tl.get("cpu_per_find_us") or {}
+    cpu = tl.get("cpu") or {}
     gpu = tl.get("gpu") or {}
     gpu_slab = tl.get("gpu_slab") or {}
-    # CPU: per-find already in µs; GPU: batch latency in ms → convert to µs (ms * 1000)
+    # All three are batch latencies over the same batch size, so they compare directly
+    # once converted to µs. Plotting the CPU's per-find latency here instead made the
+    # CPU look ~3 orders of magnitude faster than it is.
     def ms_to_us(ms):
         return (float(ms) * 1000.0) if ms is not None else None
-    cpu_vals = [cpu_us.get("p50_us"), cpu_us.get("p90_us"), cpu_us.get("p99_us")]
+    cpu_vals = [ms_to_us(cpu.get("p50_ms")), ms_to_us(cpu.get("p90_ms")), ms_to_us(cpu.get("p99_ms"))]
     gpu_vals = [ms_to_us(gpu.get("p50_ms")), ms_to_us(gpu.get("p90_ms")), ms_to_us(gpu.get("p99_ms"))]
     slab_vals = [ms_to_us(gpu_slab.get("p50_ms")), ms_to_us(gpu_slab.get("p90_ms")), ms_to_us(gpu_slab.get("p99_ms"))]
     if not any(cpu_vals) and not any(gpu_vals) and not any(slab_vals):
@@ -713,9 +759,9 @@ def plot_tail_latency(data: dict, outdir: Path) -> None:
         ax.bar(x, gpu_vals, width, label="GPU (Chained)", color="C1")
     if any(slab_vals):
         ax.bar(x + width, slab_vals, width, label="GPU (Slab)", color="C2")
-    ax.set_ylabel("Latency (µs)")
+    ax.set_ylabel("Batch latency (µs)")
     ax.set_xlabel("Percentile")
-    ax.set_title("Tail latency: CPU per-find vs GPU batch (P50 / P90 / P99)")
+    ax.set_title("Tail latency per 4096-lookup batch (P50 / P90 / P99)")
     ax.set_xticks(x)
     ax.set_xticklabels(percentiles)
     ax.legend()
@@ -792,66 +838,21 @@ def main() -> None:
     else:
         data_path = Path(args.data) if args.data else (script_dir / "benchmark_data.json")
         if not data_path.is_file():
-            print(f"Data file not found: {data_path}")
-            print("Using hardcoded sample data for demonstration.")
-            data = {
-                "interconnect": {
-                    "batch_sizes_k": [64, 128, 256, 384, 512],
-                    "standard_path_ms": [2.1, 3.8, 6.2, 8.9, 11.5],
-                    "zerocopy_path_ms": [1.4, 2.1, 3.2, 4.1, 5.0],
-                    "crossover_n": 256,
-                    "safety_margin_alpha": 0.8,
-                },
-                "warp_aggregation": {
-                    "alphas": [0.5, 1.0, 1.5, 2.0],
-                    "standard_insert_ms": [45.2, 52.1, 68.3, 89.4],
-                    "warp_agg_insert_ms": [38.1, 41.2, 48.5, 55.2],
-                },
-                "heterogeneous": {
-                    "approaches": ["CPU (unordered_map)", "GPU Chained", "GPU Warp-agg", "GPU Slab", "Hybrid (CPU+GPU lup)"],
-                    "insert_ms": [420.0, 85.0, 75.0, 12.0, 42.0],
-                    "lookup_ms": [180.0, 8.2, 7.8, 2.1, 31.0],
-                    "total_ms": [600.0, 410.0, 358.0, 1.6, 42.0],
-                    "speedup_x": [1.0, 0.18, 0.21, 46.92, 1.78],
-                    "total_ops": 1536000,
-                },
-                "load_factor": {
-                    "load_factor_pct": [10, 30, 50, 70, 90, 99],
-                    "insert_ms": [8.1, 22.3, 38.5, 52.1, 65.2, 72.1],
-                    "lookup_ms": [2.1, 3.2, 4.5, 5.8, 7.1, 8.2],
-                    "throughput_ops_per_sec": [185000, 142000, 116000, 92000, 78000, 62000],
-                    "avg_probe_depth": [1.05, 1.18, 1.35, 1.62, 2.11, 3.45],
-                },
-                "roofline": {
-                    "operations": ["Insert", "Lookup"],
-                    "achieved_gbps": [4.2, 8.5],
-                    "peak_gen3_gbps": 16,
-                    "peak_gen4_gbps": 32,
-                },
-                "tail_latency": {
-                    "gpu": {"p50_ms": 0.08, "p90_ms": 0.12, "p99_ms": 0.25},
-                    "gpu_slab": {"p50_ms": 0.05, "p90_ms": 0.09, "p99_ms": 0.18},
-                    "cpu": {"p50_ms": 2.1, "p90_ms": 3.5, "p99_ms": 5.2},
-                    "cpu_per_find_us": {"p50_us": 0.8, "p90_us": 1.5, "p99_us": 3.2},
-                },
-                "occupancy": {
-                    "block_sizes": [32, 64, 128, 256, 512, 1024],
-                    "occupancy": [0.25, 0.5, 0.75, 1.0, 0.75, 0.5],
-                    "throughput_mops": [35.2, 68.1, 95.3, 112.0, 98.5, 72.1],
-                },
-            }
-        else:
-            data = load_data(str(data_path))
+            print(f"Data file not found: {data_path}", file=sys.stderr)
+            print("Run with --run-benchmarks to measure, or pass --data <file>.", file=sys.stderr)
+            sys.exit(1)
+        data = load_data(str(data_path))
 
     plot_interconnect_crossover(data, outdir)
     plot_warp_aggregation(data, outdir)
     plot_heterogeneous_speedup(data, outdir)
     plot_timings_and_speedup(data, outdir)
+    plot_timings_by_approach(data, outdir)
     plot_load_factor_throughput(data, outdir)
     plot_roofline(data, outdir)
     plot_tail_latency(data, outdir)
     plot_occupancy_throughput(data, outdir)
-    print(f"All figures saved to {outdir.resolve()}")
+    print(f"Figures written to {outdir.resolve()}")
 
 
 if __name__ == "__main__":

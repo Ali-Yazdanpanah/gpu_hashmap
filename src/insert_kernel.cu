@@ -37,8 +37,13 @@ __global__ void insert_kernel(HashTableDevice const* table, KeyType const* keys,
   __syncthreads();
 
   SlotIndex slot = block_slots[threadIdx.x];
-  if (slot == kInvalidSlot)
+  if (slot == kInvalidSlot) {
+    /* Slab exhausted: this key is not stored. Record it so callers can tell the
+     * difference between "fast" and "gave up early". */
+    if (table->insert_failures)
+      atomicAdd(table->insert_failures, 1ull);
     return;
+  }
 
   KeyType key = keys[i];
   ValueType value = values[i];
@@ -49,13 +54,18 @@ __global__ void insert_kernel(HashTableDevice const* table, KeyType const* keys,
   node->value = value;
 
   const int max_cas_retries = 4096;
+  bool linked = false;
   for (int r = 0; r < max_cas_retries; ++r) {
     unsigned long long old_head = table->bucket_heads[b];
     node->next = static_cast<SlotIndex>(old_head);
     __threadfence();
-    if (atomicCAS(&table->bucket_heads[b], old_head, slot) == old_head)
+    if (atomicCAS(&table->bucket_heads[b], old_head, slot) == old_head) {
+      linked = true;
       break;
+    }
   }
+  if (!linked && table->insert_failures)
+    atomicAdd(table->insert_failures, 1ull);
 }
 
 namespace {
@@ -87,8 +97,11 @@ __global__ void insert_kernel_warp_aggregated(HashTableDevice const* table,
   __syncthreads();
 
   SlotIndex slot = block_slots[threadIdx.x];
-  if (slot == kInvalidSlot)
+  if (slot == kInvalidSlot) {
+    if (table->insert_failures)
+      atomicAdd(table->insert_failures, 1ull);
     return;
+  }
 
   KeyType key = keys[i];
   ValueType value = values[i];
@@ -118,8 +131,24 @@ __global__ void insert_kernel_warp_aggregated(HashTableDevice const* table,
       unsigned long long old_head = current_head;
       node->next = static_cast<SlotIndex>(old_head);
       __threadfence();
-      atomicCAS(&table->bucket_heads[b], old_head, slot);
-      current_head = slot;
+      if (atomicCAS(&table->bucket_heads[b], old_head, slot) != old_head) {
+        /* Another warp raced us on this bucket. Re-read the head and retry, or the
+         * node is allocated but never linked and the key is silently lost. */
+        const int max_cas_retries = 4096;
+        bool linked = false;
+        for (int r = 0; r < max_cas_retries; ++r) {
+          unsigned long long head_now = table->bucket_heads[b];
+          node->next = static_cast<SlotIndex>(head_now);
+          __threadfence();
+          if (atomicCAS(&table->bucket_heads[b], head_now, slot) == head_now) {
+            linked = true;
+            break;
+          }
+        }
+        if (!linked && table->insert_failures)
+          atomicAdd(table->insert_failures, 1ull);
+      }
+      current_head = table->bucket_heads[b];
     }
     current_head = shfl_sync_ull(current_head, lane);
   }

@@ -30,12 +30,30 @@ void hash_map_insert_batch_warp_aggregated(HashTable* table, KeyType const* d_ke
                                            cudaStream_t stream = nullptr);
 
 /**
+ * Number of inserts that were abandoned since the last reset: the slab ran out of
+ * slots, or the bucket-head CAS gave up. A non-zero value means the table is
+ * missing keys, so any timing or throughput measured over that batch describes
+ * less work than was requested. Synchronizing read.
+ */
+unsigned long long hash_map_insert_failure_count(HashTable const* table);
+
+/** Zero the insert-failure counter (call before a batch you want to audit). */
+void hash_map_reset_insert_failure_count(HashTable* table);
+
+/**
  * Build the table on the host from (key, value) pairs and upload to device.
  * Use for hybrid: insert on CPU, then GPU lookup only. n must be <= capacity.
  */
 void hash_map_upload_from_host(HashTable* table, KeyType const* h_keys,
                                ValueType const* h_values, size_t n,
                                cudaStream_t stream = nullptr);
+
+/**
+ * Pre-size the staging buffers used by the standard-copy lookup path so that no
+ * allocation happens on the first (or any) lookup. Call before a timed region;
+ * otherwise the first standard-copy lookup pays the allocation.
+ */
+void hash_map_reserve_lookup_scratch(HashTable* table, size_t n);
 
 /** Lookup batch: host keys in, host results out. Standard path (cudaMemcpy H2D/D2H). */
 void hash_map_lookup_batch_standard_copy(HashTable* table, KeyType const* h_keys,

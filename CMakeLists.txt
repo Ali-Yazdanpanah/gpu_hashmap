@@ -22,6 +22,8 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
+enable_testing()
+
 # -----------------------------------------------------------------------------
 # Library: hash map core (slab allocator + buckets + kernels)
 # -----------------------------------------------------------------------------
@@ -80,6 +82,11 @@ target_link_libraries(benchmark_hybrid PRIVATE gpu_hashmap)
 add_executable(test_slab tests/test_slab.cu)
 target_include_directories(test_slab PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_slab PRIVATE gpu_hashmap_slab)
+
+# Correctness tests run under CTest (`ctest --output-on-failure`). The benchmarks
+# are deliberately not registered: they are timing runs, not pass/fail checks.
+add_test(NAME test_hashmap COMMAND test_hashmap)
+add_test(NAME test_slab COMMAND test_slab)
 
 # Zero-copy (mapped memory) lookup benchmark: kernel-only vs copy+kernel
 add_executable(benchmark_zerocopy tests/benchmark_zerocopy.cu)

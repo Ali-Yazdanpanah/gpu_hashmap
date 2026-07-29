@@ -42,6 +42,41 @@ namespace {
 constexpr size_t kWarmUpProbeN = 256 * 1024;
 constexpr float kSafetyMargin = 0.8f;  /* Only use Zero-Copy if ZeroCopy_Total < Standard_Total * 0.8 */
 
+float median3(float const* v) {
+  if (v[0] < v[1]) {
+    if (v[1] < v[2]) return v[1];
+    return (v[0] < v[2]) ? v[2] : v[0];
+  }
+  if (v[0] < v[2]) return v[0];
+  return (v[1] < v[2]) ? v[2] : v[1];
+}
+
+/* Collect keys that are actually stored, by walking the chains through the mapped
+ * host view of the table. Falls back to dense integers when the table is empty. */
+void fill_probe_keys_from_table(HashTable const* table, KeyType* out, size_t n) {
+  size_t filled = 0;
+  if (table->h_bucket_heads && table->h_nodes) {
+    unsigned long long const* heads =
+        static_cast<unsigned long long const*>(table->h_bucket_heads);
+    Node const* nodes = static_cast<Node const*>(table->h_nodes);
+    for (size_t b = 0; b < table->device.num_buckets && filled < n; ++b) {
+      unsigned long long slot = heads[b];
+      /* Bound the walk by capacity so a corrupt chain cannot spin forever. */
+      size_t steps = 0;
+      while (slot != kInvalidSlot && filled < n && steps++ < table->device.capacity) {
+        out[filled++] = nodes[slot].key;
+        slot = nodes[slot].next;
+      }
+    }
+  }
+  if (filled == 0) {
+    for (size_t i = 0; i < n; ++i) out[i] = static_cast<KeyType>(i);
+    return;
+  }
+  /* Repeat what we found to cover the whole probe batch. */
+  for (size_t i = filled; i < n; ++i) out[i] = out[i % filled];
+}
+
 /* Total end-to-end time: H2D + Kernel + D2H. Uses pre-allocated device buffers (no alloc in timed region). */
 void measure_standard_total(HashTable* table, KeyType const* h_keys, ValueType* h_results,
                             KeyType* d_keys, ValueType* d_vals, size_t n,
@@ -104,19 +139,32 @@ void heuristic_warm_up(HashTable* table, HeuristicState* state, cudaStream_t str
   CUDA_CHECK(cudaMalloc(&d_keys_std, probe_n * sizeof(KeyType)));
   CUDA_CHECK(cudaMalloc(&d_vals_std, probe_n * sizeof(ValueType)));
 
-  /* Fill probe keys (assume data already in pinned memory for zero-copy path). */
-  for (size_t i = 0; i < probe_n; ++i)
-    static_cast<KeyType*>(h_pinned_keys)[i] = static_cast<KeyType>(i);
+  /* Probe with keys taken from the table so calibration sees the cost of successful
+   * finds. Synthetic keys 0..probe_n-1 are almost all absent, and a miss walks an
+   * entire chain, so both paths were dominated by the same chain-walk cost and the
+   * ratio between them was squeezed toward 1.0. */
+  fill_probe_keys_from_table(table, static_cast<KeyType*>(h_pinned_keys), probe_n);
 
-  /* Measure total end-to-end: Standard_Total = H2D + Kernel + D2H. */
-  float standard_total_ms = 0.f;
+  /* One untimed pass per path before measuring. The zero-copy path touches freshly
+   * cudaHostAlloc'd mapped pages, and paying that first-touch mapping cost inside the
+   * timed region made zero-copy look slower than it is in steady state, which set
+   * crossover_n to SIZE_MAX and pinned every later batch to the standard path. */
+  float scratch_ms = 0.f;
   measure_standard_total(table, static_cast<KeyType const*>(h_pinned_keys),
                          static_cast<ValueType*>(h_pinned_vals),
-                         d_keys_std, d_vals_std, probe_n, &standard_total_ms, stream);
+                         d_keys_std, d_vals_std, probe_n, &scratch_ms, stream);
+  measure_zerocopy_total(table, d_keys_mapped, d_vals_mapped, probe_n, &scratch_ms, stream);
 
-  /* Measure ZeroCopy_Total = Kernel only (data already in pinned memory). */
-  float zerocopy_total_ms = 0.f;
-  measure_zerocopy_total(table, d_keys_mapped, d_vals_mapped, probe_n, &zerocopy_total_ms, stream);
+  const int probe_reps = 3;
+  float std_samples[probe_reps], zc_samples[probe_reps];
+  for (int r = 0; r < probe_reps; ++r) {
+    measure_standard_total(table, static_cast<KeyType const*>(h_pinned_keys),
+                           static_cast<ValueType*>(h_pinned_vals),
+                           d_keys_std, d_vals_std, probe_n, &std_samples[r], stream);
+    measure_zerocopy_total(table, d_keys_mapped, d_vals_mapped, probe_n, &zc_samples[r], stream);
+  }
+  const float standard_total_ms = median3(std_samples);
+  const float zerocopy_total_ms = median3(zc_samples);
 
   /* Free pre-allocated buffers. */
   CUDA_CHECK(cudaFreeHost(h_pinned_keys));

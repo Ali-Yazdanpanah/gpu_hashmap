@@ -49,6 +49,9 @@ void hash_map_create(HashTable* table, size_t num_buckets, size_t capacity,
 
   table->num_buckets = num_buckets;
   table->capacity = capacity;
+  table->d_scratch_keys = nullptr;
+  table->d_scratch_values = nullptr;
+  table->scratch_capacity = 0;
 
   /* Zero-copy: mapped host memory so GPU accesses over PCIe; portable for multi-GPU. */
   const unsigned int flags = cudaHostAllocMapped | cudaHostAllocPortable;
@@ -66,6 +69,10 @@ void hash_map_create(HashTable* table, size_t num_buckets, size_t capacity,
   init_bucket_heads_kernel<<<(num_buckets + block - 1) / block, block, 0, stream>>>(
       table->device.bucket_heads, num_buckets);
   CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  CUDA_CHECK(cudaMalloc(&table->d_insert_failures, sizeof(unsigned long long)));
+  CUDA_CHECK(cudaMemset(table->d_insert_failures, 0, sizeof(unsigned long long)));
+  table->device.insert_failures = table->d_insert_failures;
 
   /* Slab and descriptor stay in device memory (small, high traffic). */
   CUDA_CHECK(cudaMalloc(&table->d_slab_device, sizeof(SlabDevice)));
@@ -88,11 +95,22 @@ void hash_map_destroy(HashTable* table) {
     CUDA_CHECK(cudaFreeHost(table->h_bucket_heads));
   if (table->h_nodes)
     CUDA_CHECK(cudaFreeHost(table->h_nodes));
+  if (table->d_scratch_keys)
+    CUDA_CHECK(cudaFree(table->d_scratch_keys));
+  if (table->d_scratch_values)
+    CUDA_CHECK(cudaFree(table->d_scratch_values));
+  if (table->d_insert_failures)
+    CUDA_CHECK(cudaFree(table->d_insert_failures));
   if (table->slab) {
     slab_destroy(table->slab);
     delete table->slab;
     table->slab = nullptr;
   }
+  table->d_scratch_keys = nullptr;
+  table->d_scratch_values = nullptr;
+  table->scratch_capacity = 0;
+  table->d_insert_failures = nullptr;
+  table->device.insert_failures = nullptr;
   table->d_device_table = nullptr;
   table->d_slab_device = nullptr;
   table->h_bucket_heads = nullptr;
@@ -116,6 +134,19 @@ void hash_map_insert_batch_warp_aggregated(HashTable* table, KeyType const* d_ke
                                            ValueType const* d_values, size_t n,
                                            cudaStream_t stream) {
   insert_batch_warp_aggregated(table->d_device_table, d_keys, d_values, n, stream);
+}
+
+unsigned long long hash_map_insert_failure_count(HashTable const* table) {
+  if (!table || !table->d_insert_failures) return 0;
+  unsigned long long count = 0;
+  CUDA_CHECK(cudaMemcpy(&count, table->d_insert_failures, sizeof(count),
+                        cudaMemcpyDeviceToHost));
+  return count;
+}
+
+void hash_map_reset_insert_failure_count(HashTable* table) {
+  if (!table || !table->d_insert_failures) return;
+  CUDA_CHECK(cudaMemset(table->d_insert_failures, 0, sizeof(unsigned long long)));
 }
 
 void hash_map_upload_from_host(HashTable* table, KeyType const* h_keys,

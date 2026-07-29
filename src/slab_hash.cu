@@ -57,6 +57,37 @@ __device__ __forceinline__ int rank_to_slot(unsigned int mask, int r) {
   return 0;
 }
 
+/**
+ * Claim any free slot in bucket `b` with a per-thread CAS and store the pair.
+ * Returns false when every slot is taken; there is no overflow bucket, so a false
+ * return means the key cannot be stored at all.
+ */
+__device__ __forceinline__ bool claim_slot_and_store(SlabHashTableDevice const* table,
+                                                     size_t b, KeyType key, ValueType value) {
+  /* Each losing CAS means some other thread set a bit, and there are only
+   * kSlabSize bits, so kSlabSize attempts is enough to distinguish "lost a race"
+   * from "genuinely full". */
+  for (int attempt = 0; attempt < kSlabSize; ++attempt) {
+    unsigned int old = *(volatile unsigned int*)(table->used_mask + b);
+    unsigned int empty = ~old & ((1u << kSlabSize) - 1);
+    if (empty == 0u) return false;
+    int s = __ffs(empty) - 1;
+    unsigned int bit = 1u << s;
+    if (atomicCAS(table->used_mask + b, old, old | bit) == old) {
+      size_t idx = b * kSlabSize + s;
+      table->keys[idx] = key;
+      table->values[idx] = value;
+      return true;
+    }
+  }
+  return false;
+}
+
+__device__ __forceinline__ void record_insert_failure(SlabHashTableDevice const* table) {
+  if (table->insert_failures)
+    atomicAdd(table->insert_failures, 1ull);
+}
+
 __global__ void slab_insert_kernel(SlabHashTableDevice const* table,
                                    KeyType const* keys, ValueType const* values, size_t n) {
   const int lane_id = threadIdx.x % 32;
@@ -82,7 +113,7 @@ __global__ void slab_insert_kernel(SlabHashTableDevice const* table,
   /* Leader loads used mask for the bucket. */
   unsigned int used = 0u;
   if (lane_id == leader_lane)
-    used = *(__volatile unsigned int*)(table->used_mask + b);
+    used = *(volatile unsigned int*)(table->used_mask + b);
   used = __shfl_sync(full_mask, used, leader_lane);
 
   unsigned int empty_bits = ~used & ((1u << kSlabSize) - 1);
@@ -102,33 +133,15 @@ __global__ void slab_insert_kernel(SlabHashTableDevice const* table,
       table->keys[idx] = key;
       table->values[idx] = value;
     } else if (!won && (same_bucket_mask & (1u << lane_id))) {
-      /* CAS failed (race); fall back to per-thread claim. */
-      for (int s = 0; s < kSlabSize; ++s) {
-        unsigned int bit = 1u << s;
-        unsigned int old = *(__volatile unsigned int*)(table->used_mask + b);
-        if (old & bit) continue;
-        if (atomicCAS(table->used_mask + b, old, old | bit) == old) {
-          size_t idx = b * kSlabSize + s;
-          table->keys[idx] = key;
-          table->values[idx] = value;
-          return;
-        }
-      }
+      /* Warp-wide claim lost the race; fall back to a per-thread claim. */
+      if (!claim_slot_and_store(table, b, key, value))
+        record_insert_failure(table);
     }
   } else {
-    /* Fallback: each thread in the group tries to claim one slot with CAS. */
+    /* Not enough free slots for the whole group: each thread claims individually. */
     if (!(same_bucket_mask & (1u << lane_id))) return;
-    for (int s = 0; s < kSlabSize; ++s) {
-      unsigned int bit = 1u << s;
-      unsigned int old = *(__volatile unsigned int*)(table->used_mask + b);
-      if (old & bit) continue;
-      if (atomicCAS(table->used_mask + b, old, old | bit) == old) {
-        size_t idx = b * kSlabSize + s;
-        table->keys[idx] = key;
-        table->values[idx] = value;
-        return;
-      }
-    }
+    if (!claim_slot_and_store(table, b, key, value))
+      record_insert_failure(table);
   }
 }
 
@@ -144,11 +157,14 @@ void slab_hash_create(SlabHashTable* table, size_t num_buckets, cudaStream_t str
   CUDA_CHECK(cudaMalloc(&table->d_values, slab_entries * sizeof(ValueType)));
   CUDA_CHECK(cudaMalloc(&table->d_used_mask, num_buckets * sizeof(unsigned int)));
   CUDA_CHECK(cudaMalloc(&table->d_device_table, sizeof(SlabHashTableDevice)));
+  CUDA_CHECK(cudaMalloc(&table->d_insert_failures, sizeof(unsigned long long)));
+  CUDA_CHECK(cudaMemset(table->d_insert_failures, 0, sizeof(unsigned long long)));
 
   table->device.keys = table->d_keys;
   table->device.values = table->d_values;
   table->device.used_mask = table->d_used_mask;
   table->device.num_buckets = num_buckets;
+  table->device.insert_failures = table->d_insert_failures;
   table->num_buckets = num_buckets;
 
   const int block = 256;
@@ -169,14 +185,30 @@ void slab_hash_destroy(SlabHashTable* table) {
   if (table->d_used_mask) CUDA_CHECK(cudaFree(table->d_used_mask));
   if (table->d_values) CUDA_CHECK(cudaFree(table->d_values));
   if (table->d_keys) CUDA_CHECK(cudaFree(table->d_keys));
+  if (table->d_insert_failures) CUDA_CHECK(cudaFree(table->d_insert_failures));
   table->d_device_table = nullptr;
   table->d_used_mask = nullptr;
   table->d_values = nullptr;
   table->d_keys = nullptr;
+  table->d_insert_failures = nullptr;
   table->device.keys = nullptr;
   table->device.values = nullptr;
   table->device.used_mask = nullptr;
+  table->device.insert_failures = nullptr;
   table->num_buckets = 0;
+}
+
+unsigned long long slab_hash_insert_failure_count(SlabHashTable const* table) {
+  if (!table || !table->d_insert_failures) return 0;
+  unsigned long long count = 0;
+  CUDA_CHECK(cudaMemcpy(&count, table->d_insert_failures, sizeof(count),
+                        cudaMemcpyDeviceToHost));
+  return count;
+}
+
+void slab_hash_reset_insert_failure_count(SlabHashTable* table) {
+  if (!table || !table->d_insert_failures) return;
+  CUDA_CHECK(cudaMemset(table->d_insert_failures, 0, sizeof(unsigned long long)));
 }
 
 void slab_hash_insert_batch(SlabHashTableDevice const* table, KeyType const* keys,

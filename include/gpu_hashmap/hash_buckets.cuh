@@ -35,6 +35,9 @@ struct HashTableDevice {
   SlabDevice const* slab;           ///< for allocating new nodes
   size_t num_buckets;               ///< number of buckets (power of two for fast modulo)
   size_t capacity;                  ///< max nodes (slab capacity)
+  /** Atomic counter of inserts that were abandoned (slab exhausted or CAS gave up).
+   *  Without this an over-full table silently loses data and still reports fast times. */
+  unsigned long long* insert_failures;
 };
 
 /**
@@ -51,9 +54,16 @@ struct HashTable {
   void* d_bucket_heads;             ///< device pointer (for kernels; may be from cudaHostGetDevicePointer)
   void* d_nodes;                    ///< device pointer (for kernels)
   SlabDevice* d_slab_device;        ///< device copy of SlabDevice (freed in destroy)
+  unsigned long long* d_insert_failures;  ///< device counter behind device.insert_failures
   SlabAllocator* slab;
   size_t num_buckets;
   size_t capacity;
+
+  /* Reusable staging buffers for the standard-copy lookup path. Kept across calls
+   * so that allocation never lands inside a timed region. Grown on demand. */
+  KeyType* d_scratch_keys;
+  ValueType* d_scratch_values;
+  size_t scratch_capacity;          ///< elements each scratch buffer can hold
 };
 
 } // namespace gpu_hashmap

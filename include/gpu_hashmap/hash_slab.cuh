@@ -28,6 +28,9 @@ struct SlabHashTableDevice {
   ValueType* values;                ///< values[bucket * kSlabSize + slot]
   unsigned int* used_mask;         ///< atomic per bucket; bit i = slot i used
   size_t num_buckets;
+  /** Atomic counter of inserts dropped because the target bucket was full.
+   *  There is no overflow bucket, so without this the loss is invisible. */
+  unsigned long long* insert_failures;
 };
 
 /** Host-owned slab hash table. */
@@ -36,12 +39,24 @@ struct SlabHashTable {
   KeyType* d_keys;
   ValueType* d_values;
   unsigned int* d_used_mask;
+  unsigned long long* d_insert_failures;
   SlabHashTableDevice* d_device_table;
   size_t num_buckets;
 };
 
 void slab_hash_create(SlabHashTable* table, size_t num_buckets, cudaStream_t stream = nullptr);
 void slab_hash_destroy(SlabHashTable* table);
+
+/**
+ * Number of inserts dropped because the target bucket had no free slot. Each bucket
+ * holds exactly kSlabSize entries and there is no overflow chain or probe to a
+ * neighbouring bucket, so a non-zero count means those keys are absent from the
+ * table and will not be found by lookup. Synchronizing read.
+ */
+unsigned long long slab_hash_insert_failure_count(SlabHashTable const* table);
+
+/** Zero the insert-failure counter (call before a batch you want to audit). */
+void slab_hash_reset_insert_failure_count(SlabHashTable* table);
 
 /** Insert batch: warp-cooperative, one atomic per warp when claiming slots. */
 void slab_hash_insert_batch(SlabHashTableDevice const* table, KeyType const* keys,

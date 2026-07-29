@@ -1,6 +1,6 @@
 # Benchmark plotting scripts
 
-Generate academic-grade figures for the GPU hash map portfolio.
+Generate the figures used in the top-level README from measured benchmark output.
 
 ## Setup
 
@@ -8,43 +8,69 @@ Generate academic-grade figures for the GPU hash map portfolio.
 pip install -r requirements-plot.txt
 ```
 
-## Data
+## Measuring and plotting
 
-**Option A — Run benchmarks from the script (recommended)**
-
-From the repo root (or `scripts/`), after building in `build/`:
+Build first, then run the benchmarks and plot in one step:
 
 ```bash
-cd build && cmake .. && make -j
-cd ../scripts
-python plot_benchmarks.py --run-benchmarks --build-dir ../build --out figures --save-json benchmark_data.json
+python scripts/plot_benchmarks.py --run-benchmarks \
+    --build-dir build \
+    --out scripts/figures \
+    --save-json scripts/benchmark_data.json
 ```
 
-This runs `benchmark_heuristic`, `benchmark_vs_cpu`, `performance_validation_suite`, and optionally `benchmark_zerocopy`, parses their stdout/stderr, merges the data, and generates the figures. Use `--save-json` to write the merged data for later runs without re-running benchmarks.
+On Windows with a multi-config generator the executables land in a config
+subdirectory, so pass that instead:
 
-**Option B — Manual runs and JSON**
+```powershell
+python scripts\plot_benchmarks.py --run-benchmarks `
+    --build-dir build\Release `
+    --out scripts\figures `
+    --save-json scripts\benchmark_data.json
+```
 
-1. Run the CUDA benchmarks and note the outputs:
-   - `./benchmark_heuristic` → interconnect sweep (warm-up line on stderr; crossover N)
-   - `./performance_validation_suite` → Zipfian (α), load factor, probe depth, roofline
-   - `./benchmark_vs_cpu` → CPU vs Chained vs Slab (insert/lookup ms)
-
-2. Edit `benchmark_data.json` and fill in the numbers (see `"note"` fields per section).
-
-## Generate figures (JSON only)
+To re-plot without re-measuring:
 
 ```bash
-python plot_benchmarks.py --data benchmark_data.json --out ../figures
+python scripts/plot_benchmarks.py --data scripts/benchmark_data.json --out scripts/figures
 ```
 
-Output (default `figures/` if `--out` omitted):
+## Which benchmark feeds which figure
 
-| File | Description |
-|------|-------------|
-| `fig1_interconnect_crossover.png` | Standard vs Zero-Copy latency; crossover point and safety margin (α=0.8) |
-| `fig2_warp_aggregation_zipfian.png` | Standard vs warp-aggregated insert time for Zipfian α = 0.5–2.0 |
-| `fig3_heterogeneous_speedup.png` | Throughput (ops/sec): CPU baseline, GPU Chained, GPU Slab |
-| `fig4_load_factor_throughput_probe_depth.png` | Dual-axis: throughput and avg probe depth vs load factor (10%–99%) |
-| `fig5_pcie_roofline.png` | Achieved effective bandwidth (Insert/Lookup) vs Gen3/Gen4 peak lines |
+| Figure | Source benchmark |
+|--------|------------------|
+| `fig1_interconnect_crossover.png` | `benchmark_heuristic` |
+| `fig2_warp_aggregation_zipfian.png` | `performance_validation_suite` |
+| `fig3_heterogeneous_speedup.png` | `benchmark_vs_cpu` |
+| `fig4_load_factor_throughput_probe_depth.png` | `performance_validation_suite` |
+| `fig5_pcie_roofline.png` | `performance_validation_suite` |
+| `fig6_tail_latency_p99.png` | `benchmark_tail_latency` (all three series, same batch size) |
+| `fig7_occupancy_throughput.png` | `benchmark_occupancy` |
+| `fig8_speedup_vs_cpu.png` | `benchmark_vs_cpu` |
+| `fig9_timings_by_approach.png` | `benchmark_vs_cpu` |
 
-Figures use IEEE/academic style (serif fonts, grid, 300 DPI) for README and papers.
+## No synthetic data
+
+Every number the script plots is parsed from benchmark stdout/stderr. The script
+does not extrapolate, interpolate, or substitute placeholder values.
+
+If a benchmark fails to run, or its output does not parse, the script prints the
+reason to stderr and **skips the affected figure** rather than plotting invented
+numbers. A missing figure therefore means "not measured", and any figure present
+in `figures/` corresponds to data present in `benchmark_data.json`.
+
+When re-plotting from JSON, a missing `--data` file is a hard error rather than a
+fallback to sample data.
+
+Figures use a serif/grid style at 300 DPI.
+
+## Measurement notes
+
+- `benchmark_vs_cpu` reports the **median of 5 runs** per approach. Its slab totals are
+  near 1 ms, so single-shot timings were dominated by scheduler noise.
+- `benchmark_heuristic` reports the median of 9 timed reps per batch size, and measures
+  *both* paths at every size rather than only the one the heuristic picks.
+- Several figures use log axes because the measured spans cover two to three orders of
+  magnitude; the axis labels say so.
+- Absolute timings on a laptop GPU vary with thermal state — see section 5 of the
+  top-level README. Ratios are far more stable than absolute milliseconds.

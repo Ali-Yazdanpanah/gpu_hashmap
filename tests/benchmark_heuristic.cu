@@ -16,10 +16,10 @@
 #include "gpu_hashmap/lookup_kernel.cuh"
 #include "gpu_hashmap/hash_buckets.cuh"
 #include <cuda_runtime.h>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-#include <chrono>
 
 #define CUDA_CHECK(call)                                                       \
   do {                                                                        \
@@ -30,6 +30,44 @@
       std::abort();                                                           \
     }                                                                         \
   } while (0)
+
+namespace {
+
+/**
+ * Run `fn` for `warmup` untimed iterations, then `reps` timed ones, and return the
+ * median wall-clock duration in ms. Median rather than mean so a single scheduling
+ * hiccup does not move the reported number.
+ */
+template <typename Fn>
+double median_ms(Fn&& fn, int warmup, int reps) {
+  for (int i = 0; i < warmup; ++i) {
+    fn();
+    CUDA_CHECK(cudaDeviceSynchronize());
+  }
+  std::vector<double> samples;
+  samples.reserve(reps);
+  for (int i = 0; i < reps; ++i) {
+    auto t0 = std::chrono::steady_clock::now();
+    fn();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto t1 = std::chrono::steady_clock::now();
+    samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+  }
+  /* Insertion sort rather than std::sort: <algorithm> pulls in <functional>, which
+   * nvcc 11.5 cannot parse against libstdc++ 11. The sample count is single digits. */
+  for (size_t i = 1; i < samples.size(); ++i) {
+    double v = samples[i];
+    size_t j = i;
+    while (j > 0 && samples[j - 1] > v) {
+      samples[j] = samples[j - 1];
+      --j;
+    }
+    samples[j] = v;
+  }
+  return samples[samples.size() / 2];
+}
+
+} // namespace
 
 int main() {
   CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
@@ -65,40 +103,46 @@ int main() {
   std::printf("  After warm-up: crossover_n = %zu\n\n", state.crossover_n);
 
   /* Sweep: use pinned buffers so Zero-Copy path is true zero-copy (no memcpy at end). */
-  const size_t max_sweep = 512 * 1024;
+  const size_t sweep_sizes[] = { 16 * 1024, 32 * 1024, 64 * 1024, 128 * 1024,
+                                 256 * 1024, 512 * 1024, 1024 * 1024 };
+  const int num_sizes = (int)(sizeof(sweep_sizes) / sizeof(sweep_sizes[0]));
+  const size_t max_sweep = sweep_sizes[num_sizes - 1];
   const unsigned int pin_flags = cudaHostAllocMapped | cudaHostAllocPortable;
   gpu_hashmap::KeyType* h_pinned_keys = nullptr;
   gpu_hashmap::ValueType* h_pinned_results = nullptr;
   CUDA_CHECK(cudaHostAlloc(&h_pinned_keys, max_sweep * sizeof(gpu_hashmap::KeyType), pin_flags));
   CUDA_CHECK(cudaHostAlloc(&h_pinned_results, max_sweep * sizeof(gpu_hashmap::ValueType), pin_flags));
 
-  const size_t sweep_sizes[] = { 64 * 1024, 128 * 1024, 256 * 1024, 384 * 1024, 512 * 1024 };
-  const int num_sizes = (int)(sizeof(sweep_sizes) / sizeof(sweep_sizes[0]));
+  /* Both paths are measured at every N so the crossover (if any) is observed
+   * rather than extrapolated. Staging buffers are reserved up front so no
+   * allocation lands inside a timed region. */
+  hash_map_reserve_lookup_scratch(&table, max_sweep);
 
-  std::printf("--- Lookup sweep (path chosen by heuristic) ---\n");
-  std::printf("  %-12s  %-14s  %-10s  %s\n", "N", "Chosen path", "Time (ms)", "");
-  std::printf("  %-12s  %-14s  %-10s  %s\n", "---", "---", "---", "---");
+  const int kWarmupReps = 2;
+  const int kTimedReps = 7;
+
+  std::printf("--- Lookup path sweep (both paths measured at every N) ---\n");
+  std::printf("  %-12s  %-14s  %-14s  %-14s  %s\n",
+              "N", "Standard(ms)", "ZeroCopy(ms)", "Chosen", "ZC/Std");
+  std::printf("  %-12s  %-14s  %-14s  %-14s  %s\n",
+              "---", "---", "---", "---", "---");
 
   for (int i = 0; i < num_sizes; ++i) {
     const size_t n = sweep_sizes[i];
     for (size_t j = 0; j < n; ++j) h_pinned_keys[j] = h_keys[j % n_insert];
 
-    gpu_hashmap::LookupPath path = heuristic_choose_path(n, &state);
-    auto t0 = std::chrono::steady_clock::now();
-    if (path == gpu_hashmap::LookupPath::ZeroCopy)
-      hash_map_lookup_batch_zero_copy(&table, h_pinned_keys, h_pinned_results, n);
-    else
+    double std_ms = median_ms([&]() {
       hash_map_lookup_batch_standard_copy(&table, h_pinned_keys, h_pinned_results, n);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto t1 = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }, kWarmupReps, kTimedReps);
 
-    const char* path_str = (path == gpu_hashmap::LookupPath::ZeroCopy) ? "Zero-Copy" : "Standard Copy";
-    std::printf("  %-12zu  %-14s  %-10.3f  (expected %s for n %s %zu)\n",
-                n, path_str, ms,
-                path_str,
-                (n >= state.crossover_n) ? ">=" : "<",
-                state.crossover_n);
+    double zc_ms = median_ms([&]() {
+      hash_map_lookup_batch_zero_copy(&table, h_pinned_keys, h_pinned_results, n);
+    }, kWarmupReps, kTimedReps);
+
+    gpu_hashmap::LookupPath path = heuristic_choose_path(n, &state);
+    const char* path_str = (path == gpu_hashmap::LookupPath::ZeroCopy) ? "Zero-Copy" : "Standard";
+    std::printf("  %-12zu  %-14.3f  %-14.3f  %-14s  %.2f\n",
+                n, std_ms, zc_ms, path_str, (std_ms > 0 ? zc_ms / std_ms : 0.0));
   }
   std::printf("\n");
 
@@ -188,17 +232,25 @@ int main() {
     for (size_t i = 0; i < n_sparse; ++i)
       h_sparse_keys[i] = h_big_keys[i % n_insert_big];
 
-    /* Standard path: full table H2D + keys H2D + kernel + results D2H */
+    /* Standard path: table H2D + keys H2D + kernel + results D2H.
+     *
+     * Only the `n_insert_big` live nodes are migrated. hash_map_upload_from_host
+     * packs nodes densely at indices [0, n_insert_big), so copying the whole
+     * `capacity_big` allocation would move mostly uninitialized memory and
+     * overstate the migration cost by the reserve ratio. The naive
+     * full-capacity copy is measured separately below for comparison. */
+    const size_t live_nodes_bytes = n_insert_big * sizeof(gpu_hashmap::Node);
+    const size_t full_nodes_bytes = capacity_big * sizeof(gpu_hashmap::Node);
     void* d_heads_copy = nullptr;
     void* d_nodes_copy = nullptr;
     CUDA_CHECK(cudaMalloc(&d_heads_copy, num_buckets_big * sizeof(unsigned long long)));
-    CUDA_CHECK(cudaMalloc(&d_nodes_copy, capacity_big * sizeof(gpu_hashmap::Node)));
+    CUDA_CHECK(cudaMalloc(&d_nodes_copy, full_nodes_bytes));
     cudaEvent_t ev1, ev2;
     CUDA_CHECK(cudaEventCreate(&ev1));
     CUDA_CHECK(cudaEventCreate(&ev2));
     CUDA_CHECK(cudaEventRecord(ev1));
     CUDA_CHECK(cudaMemcpy(d_heads_copy, big_table.h_bucket_heads, num_buckets_big * sizeof(unsigned long long), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_nodes_copy, big_table.h_nodes, capacity_big * sizeof(gpu_hashmap::Node), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_nodes_copy, big_table.h_nodes, live_nodes_bytes, cudaMemcpyHostToDevice));
     gpu_hashmap::HashTableDevice h_dev = {};
     h_dev.bucket_heads = static_cast<unsigned long long*>(d_heads_copy);
     h_dev.nodes = static_cast<gpu_hashmap::Node*>(d_nodes_copy);
@@ -219,7 +271,25 @@ int main() {
     CUDA_CHECK(cudaEventSynchronize(ev2));
     float standard_with_migration_ms = 0.f;
     CUDA_CHECK(cudaEventElapsedTime(&standard_with_migration_ms, ev1, ev2));
-    std::printf("  Standard path (full table copy + lookup): %.3f ms\n", standard_with_migration_ms);
+    std::printf("  Standard path (live-data copy + lookup):  %.3f ms  (migrated %.2f GB of %.2f GB allocated)\n",
+                standard_with_migration_ms,
+                (num_buckets_big * sizeof(unsigned long long) + live_nodes_bytes) / (1024.0 * 1024.0 * 1024.0),
+                table_bytes / (1024.0 * 1024.0 * 1024.0));
+
+    /* Naive variant: migrate the entire allocation, including never-written slots.
+     * Reported separately so the two are not conflated. */
+    CUDA_CHECK(cudaEventCreate(&ev1));
+    CUDA_CHECK(cudaEventCreate(&ev2));
+    CUDA_CHECK(cudaEventRecord(ev1));
+    CUDA_CHECK(cudaMemcpy(d_heads_copy, big_table.h_bucket_heads, num_buckets_big * sizeof(unsigned long long), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_nodes_copy, big_table.h_nodes, full_nodes_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaEventRecord(ev2));
+    CUDA_CHECK(cudaEventSynchronize(ev2));
+    float full_capacity_migration_ms = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&full_capacity_migration_ms, ev1, ev2));
+    std::printf("  Naive full-capacity migration only:       %.3f ms  (migrated %.2f GB)\n",
+                full_capacity_migration_ms, table_bytes / (1024.0 * 1024.0 * 1024.0));
+
     CUDA_CHECK(cudaFree(d_table_copy));
     CUDA_CHECK(cudaFree(d_sk));
     CUDA_CHECK(cudaFree(d_sv));

@@ -47,6 +47,9 @@ int main() {
   CUDA_CHECK(cudaMemcpy(d_lookup_keys, h_lookup_keys.data(), n * sizeof(gpu_hashmap::KeyType), cudaMemcpyHostToDevice));
 
   gpu_hashmap::slab_hash_insert_batch(table.d_device_table, d_keys, d_values, n);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  unsigned long long dropped = gpu_hashmap::slab_hash_insert_failure_count(&table);
+
   gpu_hashmap::slab_lookup_kernel<<<(n + 255) / 256, 256>>>(table.d_device_table, d_lookup_keys, d_lookup_out, n);
   CUDA_CHECK(cudaDeviceSynchronize());
   CUDA_CHECK(cudaMemcpy(h_out.data(), d_lookup_out, n * sizeof(gpu_hashmap::ValueType), cudaMemcpyDeviceToHost));
@@ -55,15 +58,22 @@ int main() {
   for (size_t i = 0; i < n; ++i)
     if (h_out[i] != h_values[i]) ++errors;
 
+  std::printf("  inserted %zu keys into %zu buckets x %d slots (%.0f%% capacity)\n",
+              n, num_buckets, gpu_hashmap::kSlabSize,
+              100.0 * n / (num_buckets * gpu_hashmap::kSlabSize));
+  std::printf("  dropped inserts (bucket full, no overflow path): %llu\n", dropped);
+  std::printf("  lookup mismatches: %d\n", errors);
+
   CUDA_CHECK(cudaFree(d_keys));
   CUDA_CHECK(cudaFree(d_values));
   CUDA_CHECK(cudaFree(d_lookup_keys));
   CUDA_CHECK(cudaFree(d_lookup_out));
   gpu_hashmap::slab_hash_destroy(&table);
 
-  if (errors == 0)
+  bool ok = (errors == 0) && (dropped == 0);
+  if (ok)
     std::printf("PASS (slab hash)\n");
   else
-    std::printf("FAIL (slab hash): %d errors\n", errors);
-  return errors ? 1 : 0;
+    std::printf("FAIL (slab hash): %d mismatches, %llu dropped inserts\n", errors, dropped);
+  return ok ? 0 : 1;
 }

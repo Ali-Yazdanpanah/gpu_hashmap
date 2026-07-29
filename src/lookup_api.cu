@@ -53,6 +53,18 @@ inline void launch_lookup(HashTableDevice const* d_table, KeyType const* d_keys,
 
 } // namespace
 
+void hash_map_reserve_lookup_scratch(HashTable* table, size_t n) {
+  if (!table || n <= table->scratch_capacity) return;
+  if (table->d_scratch_keys) CUDA_CHECK(cudaFree(table->d_scratch_keys));
+  if (table->d_scratch_values) CUDA_CHECK(cudaFree(table->d_scratch_values));
+  table->d_scratch_keys = nullptr;
+  table->d_scratch_values = nullptr;
+  table->scratch_capacity = 0;
+  CUDA_CHECK(cudaMalloc(&table->d_scratch_keys, n * sizeof(KeyType)));
+  CUDA_CHECK(cudaMalloc(&table->d_scratch_values, n * sizeof(ValueType)));
+  table->scratch_capacity = n;
+}
+
 void hash_map_lookup_batch_standard_copy(HashTable* table,
                                          KeyType const* h_keys,
                                          ValueType* h_results,
@@ -60,17 +72,14 @@ void hash_map_lookup_batch_standard_copy(HashTable* table,
                                          cudaStream_t stream) {
   if (n == 0) return;
   cudaStream_t s = stream ? stream : (cudaStream_t)0;
-  KeyType* d_keys = nullptr;
-  ValueType* d_values = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_keys, n * sizeof(KeyType)));
-  CUDA_CHECK(cudaMalloc(&d_values, n * sizeof(ValueType)));
+  hash_map_reserve_lookup_scratch(table, n);
+  KeyType* d_keys = table->d_scratch_keys;
+  ValueType* d_values = table->d_scratch_values;
   CUDA_CHECK(cudaMemcpyAsync(d_keys, h_keys, n * sizeof(KeyType), cudaMemcpyHostToDevice, s));
   launch_lookup(table->d_device_table, d_keys, d_values, n, s);
   CUDA_CHECK(cudaMemcpyAsync(h_results, d_values, n * sizeof(ValueType), cudaMemcpyDeviceToHost, s));
   if (!stream)
     CUDA_CHECK(cudaDeviceSynchronize());
-  CUDA_CHECK(cudaFree(d_keys));
-  CUDA_CHECK(cudaFree(d_values));
 }
 
 /* True Zero-Copy: caller provides pinned (mapped) buffers; kernel writes results

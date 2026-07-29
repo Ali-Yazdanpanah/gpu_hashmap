@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -49,6 +50,17 @@ static int compare_double(const void* a, const void* b) {
   double x = *(const double*)a;
   double y = *(const double*)b;
   return (x > y) ? 1 : (x < y) ? -1 : 0;
+}
+
+/* Slab totals land near 1 ms, so a single timed run is mostly scheduler noise and
+ * its "speedup vs CPU" swung between 62x and 208x across back-to-back runs. Report
+ * the median of several reps instead; it also discards the cold first-touch outlier
+ * on the mapped-memory paths. */
+static double median_of(std::vector<double> v) {
+  if (v.empty()) return 0.0;
+  qsort(v.data(), v.size(), sizeof(double), compare_double);
+  const size_t k = v.size() / 2;
+  return (v.size() % 2 != 0) ? v[k] : 0.5 * (v[k - 1] + v[k]);
 }
 
 static double percentile_from_sorted(const double* sorted, size_t len, double p) {
@@ -115,7 +127,8 @@ void run_gpu_chained(size_t num_buckets, size_t capacity,
                      std::vector<gpu_hashmap::KeyType> const& h_keys,
                      std::vector<gpu_hashmap::ValueType> const& h_values,
                      std::vector<gpu_hashmap::KeyType> const& h_lookup_keys,
-                     double* out_insert_ms, double* out_lookup_ms) {
+                     double* out_insert_ms, double* out_lookup_ms,
+                     unsigned long long* out_dropped) {
   const size_t n = h_keys.size();
   const size_t m = h_lookup_keys.size();
   gpu_hashmap::HashTable table = {};
@@ -144,6 +157,7 @@ void run_gpu_chained(size_t num_buckets, size_t capacity,
   float ms = 0.f;
   CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
   *out_insert_ms = static_cast<double>(ms);
+  *out_dropped = gpu_hashmap::hash_map_insert_failure_count(&table);
 
   CUDA_CHECK(cudaEventRecord(start));
   lookup_kernel_chained<<<(m + 255) / 256, 256>>>(table.d_device_table, d_lookup_keys, d_lookup_out, m);
@@ -166,7 +180,8 @@ void run_gpu_warp_agg(size_t num_buckets, size_t capacity,
                       std::vector<gpu_hashmap::KeyType> const& h_keys,
                       std::vector<gpu_hashmap::ValueType> const& h_values,
                       std::vector<gpu_hashmap::KeyType> const& h_lookup_keys,
-                      double* out_insert_ms, double* out_lookup_ms) {
+                      double* out_insert_ms, double* out_lookup_ms,
+                      unsigned long long* out_dropped) {
   const size_t n = h_keys.size();
   const size_t m = h_lookup_keys.size();
   gpu_hashmap::HashTable table = {};
@@ -195,6 +210,7 @@ void run_gpu_warp_agg(size_t num_buckets, size_t capacity,
   float ms = 0.f;
   CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
   *out_insert_ms = static_cast<double>(ms);
+  *out_dropped = gpu_hashmap::hash_map_insert_failure_count(&table);
 
   CUDA_CHECK(cudaEventRecord(start));
   lookup_kernel_chained<<<(m + 255) / 256, 256>>>(table.d_device_table, d_lookup_keys, d_lookup_out, m);
@@ -217,7 +233,8 @@ void run_gpu_slab(size_t num_buckets,
                   std::vector<gpu_hashmap::KeyType> const& h_keys,
                   std::vector<gpu_hashmap::ValueType> const& h_values,
                   std::vector<gpu_hashmap::KeyType> const& h_lookup_keys,
-                  double* out_insert_ms, double* out_lookup_ms) {
+                  double* out_insert_ms, double* out_lookup_ms,
+                  unsigned long long* out_dropped) {
   const size_t n = h_keys.size();
   const size_t m = h_lookup_keys.size();
   gpu_hashmap::SlabHashTable table = {};
@@ -246,6 +263,7 @@ void run_gpu_slab(size_t num_buckets,
   float ms = 0.f;
   CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
   *out_insert_ms = static_cast<double>(ms);
+  *out_dropped = gpu_hashmap::slab_hash_insert_failure_count(&table);
 
   CUDA_CHECK(cudaEventRecord(start));
   gpu_hashmap::slab_lookup_kernel<<<(m + 255) / 256, 256>>>(table.d_device_table, d_lookup_keys, d_lookup_out, m);
@@ -315,33 +333,63 @@ int main() {
   std::printf("Hash map benchmark vs CPU (std::unordered_map)\n");
   std::printf("  Inserts: %zu   Lookups: %zu   Buckets: %zu\n\n", n, m, num_buckets);
 
+  /* Random keys, fixed seed. An arithmetic sequence such as i*3 is a degenerate
+   * input here: hash_key multiplies by an odd constant and masks the low bits, so
+   * i -> bucket is a bijection over each cycle and every bucket receives exactly
+   * n / num_buckets keys. That perfect equidistribution understates chain depth,
+   * collision handling, and slab-bucket overflow relative to any real workload. */
   std::vector<gpu_hashmap::KeyType> h_keys(n);
   std::vector<gpu_hashmap::ValueType> h_values(n);
   std::vector<gpu_hashmap::KeyType> h_lookup_keys(m);
+  std::mt19937_64 rng(42);
   for (size_t i = 0; i < n; ++i) {
-    h_keys[i] = i * 3;
+    h_keys[i] = rng();
     h_values[i] = i + 1000;
   }
+  /* Lookup keys are drawn from the inserted set so every probe is a hit; this
+   * measures find-success cost rather than a mix of hits and misses. */
   for (size_t i = 0; i < m; ++i)
-    h_lookup_keys[i] = (i * 7) % (n * 3);
+    h_lookup_keys[i] = h_keys[(i * 7919) % n];
 
   double cpu_ins = 0, cpu_lup = 0;
   double gpu_chain_ins = 0, gpu_chain_lup = 0;
   double gpu_warp_ins = 0, gpu_warp_lup = 0;
   double gpu_slab_ins = 0, gpu_slab_lup = 0;
   double hybrid_build = 0, hybrid_lup = 0;
+  unsigned long long chain_dropped = 0, warp_dropped = 0, slab_dropped = 0;
 
-  run_cpu(h_keys, h_values, h_lookup_keys, &cpu_ins, &cpu_lup);
+  const int reps = 5;
+  std::vector<double> ins(reps), lup(reps);
+
+  for (int r = 0; r < reps; ++r)
+    run_cpu(h_keys, h_values, h_lookup_keys, &ins[r], &lup[r]);
+  cpu_ins = median_of(ins);
+  cpu_lup = median_of(lup);
 
   double cpu_p50_us = 0, cpu_p90_us = 0, cpu_p99_us = 0;
   run_cpu_latency_distribution(h_keys, h_values, h_lookup_keys, &cpu_p50_us, &cpu_p90_us, &cpu_p99_us);
-  std::printf("  CPU per-find latency (µs):  P50= %8.2f   P90= %8.2f   P99= %8.2f\n\n",
-              cpu_p50_us, cpu_p90_us, cpu_p99_us);
+  std::printf("  CPU per-find latency (µs):  P50= %8.2f   P90= %8.2f   P99= %8.2f\n", cpu_p50_us, cpu_p90_us, cpu_p99_us);
+  std::printf("  Each row below is the median of %d runs.\n\n", reps);
 
-  run_gpu_chained(num_buckets, capacity, h_keys, h_values, h_lookup_keys, &gpu_chain_ins, &gpu_chain_lup);
-  run_gpu_warp_agg(num_buckets, capacity, h_keys, h_values, h_lookup_keys, &gpu_warp_ins, &gpu_warp_lup);
-  run_gpu_slab(num_buckets, h_keys, h_values, h_lookup_keys, &gpu_slab_ins, &gpu_slab_lup);
-  run_hybrid(num_buckets, capacity, h_keys, h_values, h_lookup_keys, &hybrid_build, &hybrid_lup);
+  for (int r = 0; r < reps; ++r)
+    run_gpu_chained(num_buckets, capacity, h_keys, h_values, h_lookup_keys, &ins[r], &lup[r], &chain_dropped);
+  gpu_chain_ins = median_of(ins);
+  gpu_chain_lup = median_of(lup);
+
+  for (int r = 0; r < reps; ++r)
+    run_gpu_warp_agg(num_buckets, capacity, h_keys, h_values, h_lookup_keys, &ins[r], &lup[r], &warp_dropped);
+  gpu_warp_ins = median_of(ins);
+  gpu_warp_lup = median_of(lup);
+
+  for (int r = 0; r < reps; ++r)
+    run_gpu_slab(num_buckets, h_keys, h_values, h_lookup_keys, &ins[r], &lup[r], &slab_dropped);
+  gpu_slab_ins = median_of(ins);
+  gpu_slab_lup = median_of(lup);
+
+  for (int r = 0; r < reps; ++r)
+    run_hybrid(num_buckets, capacity, h_keys, h_values, h_lookup_keys, &ins[r], &lup[r]);
+  hybrid_build = median_of(ins);
+  hybrid_lup = median_of(lup);
 
   const double cpu_total = cpu_ins + cpu_lup;
   const double gpu_chain_total = gpu_chain_ins + gpu_chain_lup;
@@ -360,6 +408,18 @@ int main() {
               "GPU slab (8/bucket)", gpu_slab_ins, gpu_slab_lup, gpu_slab_total, cpu_total / (gpu_slab_total + 1e-9));
   std::printf("  %-20s  %10.2f  %10.2f  %10.2f  %7.2fx\n",
               "Hybrid (CPU+GPU lup)", hybrid_build, hybrid_lup, hybrid_total, cpu_total / (hybrid_total + 1e-9));
+
+  /* A row that dropped inserts stored fewer than n keys, so its time covers less
+   * work than the CPU baseline's and the speedup is not directly comparable. */
+  std::printf("\n  Inserts not stored (of %zu requested):\n", n);
+  std::printf("    %-20s  %10llu  (%.3f%%)\n", "GPU chained", chain_dropped,
+              100.0 * chain_dropped / n);
+  std::printf("    %-20s  %10llu  (%.3f%%)\n", "GPU warp-aggregated", warp_dropped,
+              100.0 * warp_dropped / n);
+  std::printf("    %-20s  %10llu  (%.3f%%)\n", "GPU slab (8/bucket)", slab_dropped,
+              100.0 * slab_dropped / n);
+  if (chain_dropped || warp_dropped || slab_dropped)
+    std::printf("    NOTE: non-zero above means those keys are absent from the table.\n");
 
   return 0;
 }
